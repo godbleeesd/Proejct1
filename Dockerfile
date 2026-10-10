@@ -3,13 +3,15 @@ FROM ubuntu:24.04
 
 ARG JAZZER_VERSION=0.30.0
 ARG ATHERIS_VERSION=3.1.0
+ARG CLAUDE_CODE_VERSION=2.1.295
 ARG TARGETARCH
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PATH=/opt/venv/bin:/opt/jazzer:$PATH \
-    JAZZER_JAR=/opt/jazzer/jazzer_standalone.jar
+    PATH=/opt/venv/bin:/opt/jazzer:/root/.local/bin:$PATH \
+    JAZZER_JAR=/opt/jazzer/jazzer_standalone.jar \
+    DISABLE_AUTOUPDATER=1
 
 # Toolchains: Python + Atheris, clang/libFuzzer + sanitizers, JDK + Maven + Jazzer,
 # and the usual build systems for compiling C/C++ components from source.
@@ -30,6 +32,11 @@ RUN case "${TARGETARCH:-amd64}" in \
     && curl -fsSL "https://github.com/CodeIntelligenceTesting/jazzer/releases/download/v${JAZZER_VERSION}/jazzer-linux-${arch}.tar.gz" \
         | tar -xz -C /opt/jazzer \
     && test -x /opt/jazzer/jazzer && test -f "$JAZZER_JAR"
+
+# Claude Code CLI for the subscription backend. Installed under /root, which the
+# sandbox user cannot read.
+RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}" \
+    && claude --version
 
 RUN python3 -m venv /opt/venv \
     && pip install --no-cache-dir "atheris==${ATHERIS_VERSION}"

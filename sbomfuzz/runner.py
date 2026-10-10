@@ -16,15 +16,20 @@ from pathlib import Path
 import anthropic
 
 from . import report
-from .agent import AgentConfig, FuzzAgent
+from .agent import FuzzAgent
+from .claude_code import ClaudeCodeAgent, ClaudeCodeAuthError
 from .ecosystems import ECOSYSTEMS
 from .fetch import FetchError, fetch
+from .prompts import AgentConfig
 from .report import ComponentResult
 from .sbom import Component, load_cyclonedx
+from .tools import ToolBox
 from .usage import BudgetTracker
 from .workspace import Workspace
 
 log = logging.getLogger(__name__)
+
+BACKENDS = ("api", "subscription")
 
 
 @dataclass
@@ -32,6 +37,7 @@ class RunConfig:
     sbom: Path
     out: Path
     workdir: Path
+    backend: str = "api"  # api: Messages API with ANTHROPIC_API_KEY; subscription: Claude Code CLI
     agent: AgentConfig = field(default_factory=AgentConfig)
     ecosystems: list[str] = field(default_factory=lambda: list(ECOSYSTEMS))
     include: list[str] = field(default_factory=list)  # glob patterns on name / purl
@@ -39,6 +45,24 @@ class RunConfig:
     jobs: int = 1
     budget_usd: float | None = None
     keep_workdirs: bool = False
+
+
+@dataclass
+class _Shared:
+    """State shared by all components of a run."""
+
+    config: RunConfig
+    tracker: BudgetTracker
+    client: anthropic.Anthropic | None
+    total: int
+    stop_reason: str | None = None  # set when no further component should start
+    started: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def next_tag(self) -> str:
+        with self.lock:
+            self.started += 1
+            return f"[{self.started}/{self.total}]"
 
 
 def select(components: list[Component], config: RunConfig) -> list[Component]:
@@ -56,9 +80,6 @@ def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
     config.out.mkdir(parents=True, exist_ok=True)
     config.workdir.mkdir(parents=True, exist_ok=True)
 
-    tracker = BudgetTracker(config.budget_usd)
-    client = anthropic.Anthropic(max_retries=5)
-
     results: dict[str, ComponentResult] = {}
     todo: list[Component] = []
     for c in components:
@@ -72,11 +93,12 @@ def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
         else:
             todo.append(c)
 
-    log.info("%d components in SBOM, %d to fuzz", len(components), len(todo))
-    counter = _Counter(len(todo))
+    client = anthropic.Anthropic(max_retries=5) if config.backend == "api" else None
+    shared = _Shared(config, BudgetTracker(config.budget_usd), client, len(todo))
+    log.info("%d components in SBOM, %d to fuzz (backend: %s)", len(components), len(todo), config.backend)
 
     def work(c: Component) -> None:
-        results[c.key] = _process(c, config, client, tracker, counter)
+        results[c.key] = _process(c, shared)
 
     if config.jobs <= 1:
         for c in todo:
@@ -92,32 +114,30 @@ def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
         "sbom": str(config.sbom),
         "started": started.isoformat(timespec="seconds"),
         "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "model": config.agent.model,
+        "backend": config.backend,
+        "model": config.agent.model or "default",
         "effort": config.agent.effort,
         "fuzz_seconds_per_run": config.agent.fuzz_seconds,
     }
-    report.write_json(config.out / "report.json", meta, ordered, tracker.total)
-    (config.out / "report.md").write_text(report.render_markdown(meta, ordered, tracker.total), encoding="utf-8")
+    total = shared.tracker.total
+    report.write_json(config.out / "report.json", meta, ordered, total)
+    (config.out / "report.md").write_text(report.render_markdown(meta, ordered, total), encoding="utf-8")
     _match_owner(config.out)
     return ordered, meta
 
 
-class _Counter:
-    def __init__(self, total: int):
-        self.total, self.n, self._lock = total, 0, threading.Lock()
-
-    def next(self) -> str:
-        with self._lock:
-            self.n += 1
-            return f"[{self.n}/{self.total}]"
-
-
-def _process(c: Component, config: RunConfig, client, tracker: BudgetTracker, counter: _Counter) -> ComponentResult:
-    tag = counter.next()
+def _process(c: Component, shared: _Shared) -> ComponentResult:
+    config = shared.config
+    tag = shared.next_tag()
     result = ComponentResult(c.to_dict(), "error")
-    if tracker.exhausted():
-        result.status, result.detail = "budget_exhausted", "the run's budget was used up before this component"
-        log.info("%s %s: skipped, budget exhausted", tag, c.display_name)
+    if shared.stop_reason is None and shared.tracker.exhausted():
+        shared.stop_reason = "budget_exhausted"
+    if shared.stop_reason:
+        result.status = shared.stop_reason
+        result.detail = {"budget_exhausted": "the run's budget was used up before this component",
+                         "usage_limit": "the subscription usage limit was reached before this component"
+                         }.get(shared.stop_reason, "")
+        log.info("%s %s: skipped (%s)", tag, c.display_name, shared.stop_reason)
         return result
 
     start = time.monotonic()
@@ -126,6 +146,8 @@ def _process(c: Component, config: RunConfig, client, tracker: BudgetTracker, co
     ws = Workspace.create(ws_root)
     artifacts = config.out / "components" / c.slug
     artifacts.mkdir(parents=True, exist_ok=True)
+    transcript = artifacts / "transcript.jsonl"
+    session_dir = _sessions_root() / c.slug
     try:
         log.info("%s %s (%s): downloading", tag, c.display_name, c.ecosystem)
         try:
@@ -136,16 +158,25 @@ def _process(c: Component, config: RunConfig, client, tracker: BudgetTracker, co
             return result
 
         log.info("%s %s: agent started", tag, c.display_name)
-        agent = FuzzAgent(client, config.agent, ECOSYSTEMS[c.ecosystem], c, ws, fetched.detail, tracker,
-                          artifacts / "transcript.jsonl")
+        ecosystem = ECOSYSTEMS[c.ecosystem]
+        if config.backend == "subscription":
+            agent = ClaudeCodeAgent(config.agent, ecosystem, c, ws, fetched.detail, shared.tracker, transcript,
+                                    session_dir)
+        else:
+            toolbox = ToolBox(ws, ecosystem, config.agent.fuzz_seconds, config.agent.command_timeout,
+                              transcript, c.display_name)
+            agent = FuzzAgent.for_component(shared.client, config.agent, ecosystem, c, ws, fetched.detail,
+                                            shared.tracker, toolbox)
         outcome = agent.run()
         result.status, result.detail, result.report = outcome.status, outcome.detail, outcome.report
         result.usage, result.turns, result.fuzz_runs = outcome.usage, outcome.turns, outcome.fuzz_runs
+        if outcome.status == "usage_limit":
+            shared.stop_reason = "usage_limit"
         cost = f"${outcome.usage.cost_usd:.2f}" if outcome.usage.cost_usd is not None else "n/a"
-        log.info("%s %s: %s, %d bug(s), %d turns, %s", tag, c.display_name, result.status,
+        log.info("%s %s: %s, %d bug(s), %d turns, est. %s", tag, c.display_name, result.status,
                  len(result.bugs), outcome.turns, cost)
         return result
-    except anthropic.AuthenticationError:
+    except (anthropic.AuthenticationError, ClaudeCodeAuthError):
         raise
     except Exception as e:
         log.exception("%s %s: failed", tag, c.display_name)
@@ -155,8 +186,16 @@ def _process(c: Component, config: RunConfig, client, tracker: BudgetTracker, co
         result.duration_seconds = time.monotonic() - start
         _save_artifacts(ws, artifacts)
         result.artifacts = str(artifacts)
+        shutil.rmtree(session_dir, ignore_errors=True)
         if not config.keep_workdirs:
             shutil.rmtree(ws_root, ignore_errors=True)
+
+
+def _sessions_root() -> Path:
+    # Under the orchestrator's home (/root in the image), which the sandbox user cannot enter.
+    root = Path.home() / ".cache" / "sbomfuzz" / "sessions"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def _save_artifacts(ws: Workspace, dest: Path) -> None:

@@ -63,11 +63,12 @@ def render_markdown(meta: dict, results: list[ComponentResult], total: Usage) ->
         "",
         f"- SBOM: `{meta['sbom']}`",
         f"- Started: {meta['started']}, finished: {meta['finished']}",
-        f"- Model: `{meta['model']}` (effort {meta['effort']})",
+        f"- Backend: {meta.get('backend', 'api')}, model: `{meta['model']}` (effort {meta['effort']})",
         f"- Components: {len(results)}, fuzzed: {sum(r.status == 'completed' for r in results)}, "
         f"bugs found: {len(bugs)}",
         f"- Tokens: {total.input_tokens + total.cache_read_tokens + total.cache_write_tokens:,} in, "
-        f"{total.output_tokens:,} out; estimated cost {cost}",
+        f"{total.output_tokens:,} out; estimated API-equivalent cost {cost}"
+        + (" (covered by the subscription)" if meta.get("backend") == "subscription" else ""),
         "",
         "## Components",
         "",

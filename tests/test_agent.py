@@ -1,9 +1,11 @@
 import json
 from types import SimpleNamespace
 
-from sbomfuzz.agent import FALLBACK_BETA, AgentConfig, FuzzAgent
+from sbomfuzz.agent import FALLBACK_BETA, FuzzAgent
 from sbomfuzz.ecosystems import ECOSYSTEMS
+from sbomfuzz.prompts import AgentConfig
 from sbomfuzz.sbom import Component
+from sbomfuzz.tools import ToolBox
 from sbomfuzz.usage import BudgetTracker
 
 REPORT = {"summary": "done", "harnesses": [], "findings": [], "limitations": ""}
@@ -56,8 +58,9 @@ COMPONENT = Component(name="toml", version="0.10.2", group=None, purl="pkg:pypi/
 def make_agent(ws, responses, budget=None, **config):
     client = FakeClient(responses)
     tracker = BudgetTracker(budget)
-    agent = FuzzAgent(client, AgentConfig(**config), ECOSYSTEMS["python"], COMPONENT, ws, "installed", tracker,
-                      ws.root / "transcript.jsonl")
+    cfg = AgentConfig(**config)
+    toolbox = ToolBox(ws, ECOSYSTEMS["python"], cfg.fuzz_seconds, cfg.command_timeout, ws.root / "transcript.jsonl")
+    agent = FuzzAgent.for_component(client, cfg, ECOSYSTEMS["python"], COMPONENT, ws, "installed", tracker, toolbox)
     return agent, client, tracker
 
 
@@ -88,7 +91,17 @@ def test_completes_when_report_is_submitted(ws):
     assert "toml@0.10.2" in first["messages"][0]["content"]
 
     log = [json.loads(line) for line in (ws.root / "transcript.jsonl").read_text().splitlines()]
-    assert [e["type"] for e in log] == ["text", "tool_call", "tool_result", "tool_call"]
+    assert [e["type"] for e in log] == ["text", "tool_call", "tool_result", "tool_call", "tool_result"]
+
+
+def test_malformed_report_is_rejected(ws):
+    agent, client, _ = make_agent(ws, [
+        response(tool("submit_report", {**REPORT, "findings": [{"verdict": "maybe", "severity": "huge"}]}, "r1")),
+        response(tool("submit_report", REPORT, "r2")),
+    ])
+    assert agent.run().status == "completed"
+    rejected = client.calls[1]["messages"][2]["content"][0]
+    assert rejected["is_error"] is True and "Report rejected" in rejected["content"]
 
 
 def test_write_outside_workspace_is_refused(ws):
