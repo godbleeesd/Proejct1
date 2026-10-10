@@ -3,8 +3,9 @@
 Everything the agent runs executes third-party code. When the orchestrator runs
 as root (the default in the Docker image), commands are started as the
 unprivileged sandbox user, so they cannot read the orchestrator's environment
-(/proc/<pid>/environ) or files and thereby the Anthropic API key. ANTHROPIC_*
-variables are also stripped from the environment passed to children.
+(/proc/<pid>/environ) or files and thereby the Anthropic API key or subscription
+token. ANTHROPIC_* and CLAUDE_* variables are also stripped from the environment
+passed to children.
 """
 
 from __future__ import annotations
@@ -23,6 +24,9 @@ except ImportError:  # Windows: no sandbox user, commands run as the current use
     pwd = None
 
 SANDBOX_USER = os.environ.get("SBOMFUZZ_SANDBOX_USER", "fuzzer")
+
+# API keys and the subscription token (CLAUDE_CODE_OAUTH_TOKEN) never reach sandboxed code.
+SECRET_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_")
 
 # LeakSanitizer needs ptrace, which Docker forbids by default.
 SANITIZER_ENV = {
@@ -58,7 +62,7 @@ def sandbox_active() -> bool:
 
 
 def child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    env = {k: v for k, v in os.environ.items() if not k.startswith("ANTHROPIC_")}
+    env = {k: v for k, v in os.environ.items() if not k.startswith(SECRET_ENV_PREFIXES)}
     env.update(SANITIZER_ENV)
     env["GIT_TERMINAL_PROMPT"] = "0"
     ids = _sandbox_ids()

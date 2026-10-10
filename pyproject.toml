@@ -11,6 +11,7 @@ requires-python = ">=3.12"
 dependencies = [
     "anthropic>=1.13,<2",
     "packageurl-python>=0.17",
+    "mcp>=2.3,<3",
 ]
 
 [project.optional-dependencies]
