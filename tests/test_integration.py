@@ -36,15 +36,14 @@ atheris.Fuzz()
 
 C_HARNESS = """\
 #include <stdint.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stddef.h>
 
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size > 0 && data[0] == 'B') {
-        volatile size_t n = 5;
-        char *p = malloc(4);
-        memset(p, 0, n);
-        free(p);
+        /* libFuzzer passes a heap copy of exactly `size` bytes: one past the end
+           is a heap-buffer-overflow. volatile keeps the optimizer from removing it. */
+        volatile uint8_t past_end = data[size];
+        (void)past_end;
     }
     return 0;
 }
