@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t sbomfuzz:ci .
+
+      - name: Unit and integration tests (inside the image)
+        run: >
+          docker run --rm -v "$PWD:/src" -w /src --entrypoint sh sbomfuzz:ci
+          -c "pip install --quiet pytest && pytest -v -p no:cacheprovider"
+
+      - name: CLI smoke test
+        run: docker run --rm -v "$PWD/examples:/examples:ro" sbomfuzz:ci list /examples/sample-bom.json
