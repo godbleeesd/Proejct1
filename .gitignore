@@ -9,3 +9,12 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# sbomfuzz output
+sbomfuzz-results/
