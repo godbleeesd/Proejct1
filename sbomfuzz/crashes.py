@@ -63,7 +63,10 @@ def classify(output: str) -> CrashInfo:
     m = _JAVA_EXC.search(output)
     if m:
         kind = m.group(1)
-        frames = _JAVA_FRAME.findall(output[m.start():])
+        # Jazzer's bug detectors throw from their own hooks; locate the finding in the
+        # code under test instead, or every finding of one detector would look the same.
+        frames = [f for f in _JAVA_FRAME.findall(output[m.start():])
+                  if not f[0].startswith("com.code_intelligence.jazzer.")]
         where = f"{frames[0][0]}({frames[0][1]})" if frames else ""
         message = (m.group(2) or "").strip()
         summary = f"{kind}: {message[:120]}" if message else kind

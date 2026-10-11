@@ -54,7 +54,18 @@ UBSAN = """\
 SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/cJSON_Utils.c:71:21
 """
 
-TIMEOUT ="ALARM: working on the last Unit for 26 seconds\n       and the timeout value is 25 (use -timeout=N to change)\n"
+JAZZER_DETECTOR = """\
+== Java Exception: com.code_intelligence.jazzer.api.FuzzerSecurityIssueLow: Regular Expression Injection
+Regular expression patterns that contain unescaped untrusted input can consume
+arbitrary amounts of CPU time.
+\tat com.code_intelligence.jazzer.sanitizers.RegexInjection.hookInternal(RegexInjection.kt:164)
+\tat com.code_intelligence.jazzer.sanitizers.RegexInjection.patternHook(RegexInjection.kt:85)
+\tat org.jsoup.select.QueryParser.byAttribute(QueryParser.java:311)
+\tat org.jsoup.select.QueryParser.consumeEvaluator(QueryParser.java:175)
+\tat SelectCss.fuzzerTestOneInput(SelectCss.java:16)
+"""
+
+TIMEOUT = "ALARM: working on the last Unit for 26 seconds\n       and the timeout value is 25 (use -timeout=N to change)\n"
 
 
 def result(output, code=0, timed_out=False):
@@ -107,6 +118,14 @@ def test_classify_java_exception():
     assert info.kind == "java.lang.IllegalStateException"
     assert info.signature == "java.lang.IllegalStateException DemoFuzzer.fuzzerTestOneInput(DemoFuzzer.java:6)"
     assert "planted bug" in info.summary
+
+
+def test_classify_jazzer_detector_finding_points_at_the_code_under_test():
+    # Found in the first real jsoup run: the location was Jazzer's own hook frame.
+    info = classify(JAZZER_DETECTOR)
+    assert info.kind == "com.code_intelligence.jazzer.api.FuzzerSecurityIssueLow"
+    assert info.signature.endswith("org.jsoup.select.QueryParser.byAttribute(QueryParser.java:311)")
+    assert "Regular Expression Injection" in info.summary
 
 
 def test_classify_timeout_and_unknown():
