@@ -1,9 +1,9 @@
 """Fuzzing one validated harness for a fixed time, without the model.
 
 libFuzzer-style fuzzers stop at the first crash. To keep fuzzing past it, the campaign
-restarts the fuzzer on the same (growing) corpus until the time budget is spent. Crashes
-are grouped by signature; after a few restarts that only rediscover known crashes the
-harness is considered exhausted (the known bug keeps masking everything behind it).
+restarts the fuzzer on the same (growing) corpus until the time budget is spent, so deep
+bugs get the full time even when a shallow one keeps recurring. Crashes are grouped by
+signature; inputs that only rediscover a known crash are deleted and just counted.
 """
 
 from __future__ import annotations
@@ -18,7 +18,6 @@ from .workspace import Workspace
 
 log = logging.getLogger(__name__)
 
-MAX_DUPLICATE_RESTARTS = 5
 MIN_RUN_SECONDS = 5
 
 
@@ -55,7 +54,10 @@ class HarnessResult:
         return d
 
 
-def run_campaign(ws: Workspace, ecosystem: Ecosystem, name: str, target: str, seconds: int) -> HarnessResult:
+def run_campaign(ws: Workspace, ecosystem: Ecosystem, name: str, target: str, seconds: int,
+                 stop_after_duplicates: int = 0) -> HarnessResult:
+    """Fuzz for `seconds`. With stop_after_duplicates > 0, stop early once that many restarts
+    in a row found only known crashes."""
     result = HarnessResult(name=name, target=target)
     corpus = ws.corpus / name
     deadline = time.monotonic() + seconds
@@ -81,7 +83,9 @@ def run_campaign(ws: Workspace, ecosystem: Ecosystem, name: str, target: str, se
         if group:
             group.count += 1
             duplicates_in_a_row += 1
-            if duplicates_in_a_row >= MAX_DUPLICATE_RESTARTS:
+            for path in run.new_files:  # keep crashes/ to one input per signature
+                (ws.root / path).unlink(missing_ok=True)
+            if stop_after_duplicates and duplicates_in_a_row >= stop_after_duplicates:
                 log.info("  %s: only known crashes for %d restarts, stopping", name, duplicates_in_a_row)
                 break
         else:

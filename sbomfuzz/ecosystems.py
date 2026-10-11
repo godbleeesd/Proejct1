@@ -41,6 +41,7 @@ class FuzzRun:
     executions: int = 0
     crash_files: list[str] = field(default_factory=list)
     duration: float = 0.0
+    new_files: list[str] = field(default_factory=list)  # everything the run added to crashes/
 
 
 class Ecosystem:
@@ -84,8 +85,11 @@ class Ecosystem:
                              str(corpus)]
         before = set(os.listdir(ws.crashes))
         result = sandbox.run(command, cwd=ws.root, timeout=seconds + 120, env=env, output_limit=200_000)
-        new = sorted(n for n in set(os.listdir(ws.crashes)) - before if not n.endswith(".java"))
-        return summarize(result, [f"crashes/{n}" for n in new])
+        added = sorted(set(os.listdir(ws.crashes)) - before)
+        # Jazzer also writes a Crash_*.java reproducer next to each crash input.
+        run = summarize(result, [f"crashes/{n}" for n in added if not n.endswith(".java")])
+        run.new_files = [f"crashes/{n}" for n in added]
+        return run
 
     def repro_command(self, ws: Workspace, target: str, crash_file: str) -> str:
         """Shell command (run in the workspace) that replays one crash input."""

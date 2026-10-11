@@ -24,14 +24,28 @@ class ComponentResult:
     artifacts: str | None = None
 
     @property
-    def crashes(self) -> list[tuple[dict, dict]]:
-        return [(h, c) for h in self.harnesses for c in h.get("crashes", [])]
+    def crashes(self) -> list[dict]:
+        """Unique crashes across all harnesses: the same signature found by several harnesses
+        is one crash. Each keeps the first harness's input and reproduction."""
+        merged: dict[str, dict] = {}
+        for h in self.harnesses:
+            for c in h.get("crashes", []):
+                entry = merged.get(c["signature"])
+                if entry is None:
+                    merged[c["signature"]] = {**c, "harness": h["name"], "source": h["source"],
+                                              "target_api": h.get("target_api", ""), "found_by": [h["name"]]}
+                else:
+                    entry["count"] += c["count"]
+                    if h["name"] not in entry["found_by"]:
+                        entry["found_by"].append(h["name"])
+        return list(merged.values())
 
     def to_dict(self) -> dict:
         return {
             "component": self.component,
             "status": self.status,
             "detail": self.detail,
+            "crashes": self.crashes,
             "harnesses": self.harnesses,
             "generation": {"attempts": self.attempts, "turns": self.turns, "validation": self.validation},
             "usage": self.usage.to_dict(),
@@ -46,7 +60,7 @@ def write_json(path: Path, meta: dict, results: list[ComponentResult], total: Us
 
 
 def render_markdown(meta: dict, results: list[ComponentResult], total: Usage) -> str:
-    crashes = [(r, h, c) for r in results for h, c in r.crashes]
+    crashes = [(r, c) for r in results for c in r.crashes]
     cost = f"${total.cost_usd:.2f}" if total.cost_usd is not None else "n/a"
     out = [
         "# SBOM fuzzing report",
@@ -77,13 +91,15 @@ def render_markdown(meta: dict, results: list[ComponentResult], total: Usage) ->
 
     if crashes:
         out += ["", "## Crashes", ""]
-        for i, (r, h, c) in enumerate(crashes, 1):
+        for i, (r, c) in enumerate(crashes, 1):
             comp = r.component
+            found_by = ", ".join(f"`{n}`" for n in c["found_by"])
             out += [
                 f"### {i}. {c['kind']} in `{comp['name']}@{comp.get('version') or '?'}`",
                 "",
                 f"- Summary: {c['summary']}",
-                f"- Harness: `{h['name']}` (`{h['source']}`), API: {h.get('target_api', '-')}",
+                f"- Found by: {found_by}; input and command below are from `{c['harness']}` "
+                f"(`{c['source']}`, API: {c['target_api'] or '-'})",
                 f"- Input: `{c['crash_file'] or '-'}` (hit {c['count']} time(s))",
                 f"- Artifacts: `{r.artifacts or '-'}`",
                 f"- Reproduce in the workspace (`--keep-workdirs`): `{c['reproduction'] or '-'}`",

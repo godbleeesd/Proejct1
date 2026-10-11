@@ -44,6 +44,9 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--limit", type=int, help="fuzz at most this many components")
     p_run.add_argument("-j", "--jobs", type=int, default=1, help="components processed in parallel (default 1)")
     p_run.add_argument("--fuzz-seconds", type=int, default=600, help="fuzzing time per harness (default 600)")
+    p_run.add_argument("--stop-after-duplicates", type=int, default=0, metavar="N",
+                       help="stop fuzzing a harness early after N restarts in a row that found only known "
+                            "crashes (default 0: always use the full --fuzz-seconds)")
     p_run.add_argument("--max-harnesses", type=int, default=3, help="harnesses per component (default 3)")
     p_run.add_argument("--fix-attempts", type=int, default=3,
                        help="validation rounds in which Claude may fix failing harnesses (default 3)")
@@ -119,6 +122,7 @@ def _run(args) -> int:
             language=args.language,
         ),
         fuzz_seconds=args.fuzz_seconds,
+        stop_after_duplicates=args.stop_after_duplicates,
         ecosystems=args.ecosystem or list(ECOSYSTEMS),
         include=args.component,
         limit=args.limit,
