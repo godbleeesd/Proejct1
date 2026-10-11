@@ -135,6 +135,8 @@ def _process(c: Component, shared: _Shared) -> ComponentResult:
     shutil.rmtree(ws_root, ignore_errors=True)
     ws = Workspace.create(ws_root)
     artifacts = config.out / "components" / c.slug
+    # Start clean: reusing --out must not mix crash files from earlier runs into this one.
+    shutil.rmtree(artifacts, ignore_errors=True)
     artifacts.mkdir(parents=True, exist_ok=True)
     session_dir = _sessions_root() / c.slug
     ecosystem = ECOSYSTEMS[c.ecosystem]

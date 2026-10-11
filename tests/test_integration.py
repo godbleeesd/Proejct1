@@ -180,6 +180,11 @@ def test_full_pipeline(monkeypatch, tmp_path):
         {"type": "library", "name": "left-pad", "version": "1.3.0", "purl": "pkg:npm/left-pad@1.3.0"}]}))
     work = Path(tempfile.mkdtemp(prefix="sbomfuzz-work-"))
     work.chmod(0o755)
+    # Leftovers from an earlier run with the same --out must not end up in this report.
+    from sbomfuzz.sbom import load_cyclonedx
+    stale = tmp_path / "out" / "components" / load_cyclonedx(sbom)[0].slug / "crashes" / "crash-stale"
+    stale.parent.mkdir(parents=True)
+    stale.write_text("old")
     try:
         results, _ = run(RunConfig(sbom=sbom, out=tmp_path / "out", workdir=work, agent=AgentConfig(),
                                    fuzz_seconds=20))
@@ -194,6 +199,8 @@ def test_full_pipeline(monkeypatch, tmp_path):
     assert "unique crashes: 1" in report and "RuntimeError in `toml@0.10.2`" in report
     artifacts = Path(toml_result.artifacts)
     assert (artifacts / "harnesses" / "fuzz_demo.py").exists()
+    assert not stale.exists()
+    assert len(list((artifacts / "crashes").glob("crash-*"))) == 1  # duplicates of the one crash were dropped
     assert sorted(p.name for p in (artifacts / "seeds" / "demo").iterdir()) == ["seed-1", "seed-2", "seed-3"]
 
 
