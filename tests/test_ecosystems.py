@@ -40,6 +40,31 @@ JAVA = """\
 DEDUP_TOKEN: 0123456789abcdef
 """
 
+UBSAN = """\
+#1024\tpulse  cov: 1500 ft: 9000 corp: 800/300Kb exec/s: 20000 rss: 560Mb
+/tmp/sbomfuzz-work/cjson-1/src/cJSON_Utils.c:71:21: runtime error: null pointer passed as argument 1, which is declared to never be null
+/usr/include/string.h:407:33: note: nonnull attribute specified here
+    #0 0x5a1 in cJSONUtils_strdup /tmp/sbomfuzz-work/cjson-1/src/cJSON_Utils.c:71:14
+    #1 0x5a2 in detach_path /tmp/sbomfuzz-work/cjson-1/src/cJSON_Utils.c:438:22
+    #4 0x5a3 in LLVMFuzzerTestOneInput /tmp/sbomfuzz-work/cjson-1/harnesses/fuzz_patch.c:20:13
+    #5 0x5a4 in fuzzer::Fuzzer::ExecuteCallback(unsigned char const*, unsigned long) (/tmp/x/build/fuzz_patch+0x76cc4)
+    #10 0x5a5 in main (/tmp/x/build/fuzz_patch+0x90066)
+    #11 0x7b4  (/lib/x86_64-linux-gnu/libc.so.6+0x2a1c9)
+
+SUMMARY: UndefinedBehaviorSanitizer: undefined-behavior src/cJSON_Utils.c:71:21
+"""
+
+JAZZER_DETECTOR = """\
+== Java Exception: com.code_intelligence.jazzer.api.FuzzerSecurityIssueLow: Regular Expression Injection
+Regular expression patterns that contain unescaped untrusted input can consume
+arbitrary amounts of CPU time.
+\tat com.code_intelligence.jazzer.sanitizers.RegexInjection.hookInternal(RegexInjection.kt:164)
+\tat com.code_intelligence.jazzer.sanitizers.RegexInjection.patternHook(RegexInjection.kt:85)
+\tat org.jsoup.select.QueryParser.byAttribute(QueryParser.java:311)
+\tat org.jsoup.select.QueryParser.consumeEvaluator(QueryParser.java:175)
+\tat SelectCss.fuzzerTestOneInput(SelectCss.java:16)
+"""
+
 TIMEOUT = "ALARM: working on the last Unit for 26 seconds\n       and the timeout value is 25 (use -timeout=N to change)\n"
 
 
@@ -68,6 +93,18 @@ def test_classify_sanitizer_crash():
     assert info.stack.startswith("ERROR: AddressSanitizer")
 
 
+def test_classify_ubsan_keeps_the_error_line():
+    # Found in the first real cJSON run: the excerpt started mid-stack, without the error itself.
+    info = classify(UBSAN)
+    assert info.kind == "undefined-behavior"
+    assert info.signature == "undefined-behavior cJSON_Utils.c:71:21"
+    assert "null pointer passed as argument 1" in info.summary
+    assert info.stack.splitlines()[0].endswith("runtime error: null pointer passed as argument 1, "
+                                               "which is declared to never be null")
+    assert "detach_path" in info.stack and "LLVMFuzzerTestOneInput" in info.stack
+    assert "fuzzer::Fuzzer" not in info.stack and "libc.so" not in info.stack and " in main " not in info.stack
+
+
 def test_classify_python_exception_uses_innermost_frame():
     info = classify(PYTHON)
     assert info.kind == "IndexError"
@@ -81,6 +118,14 @@ def test_classify_java_exception():
     assert info.kind == "java.lang.IllegalStateException"
     assert info.signature == "java.lang.IllegalStateException DemoFuzzer.fuzzerTestOneInput(DemoFuzzer.java:6)"
     assert "planted bug" in info.summary
+
+
+def test_classify_jazzer_detector_finding_points_at_the_code_under_test():
+    # Found in the first real jsoup run: the location was Jazzer's own hook frame.
+    info = classify(JAZZER_DETECTOR)
+    assert info.kind == "com.code_intelligence.jazzer.api.FuzzerSecurityIssueLow"
+    assert info.signature.endswith("org.jsoup.select.QueryParser.byAttribute(QueryParser.java:311)")
+    assert "Regular Expression Injection" in info.summary
 
 
 def test_classify_timeout_and_unknown():
