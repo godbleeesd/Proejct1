@@ -27,10 +27,10 @@ def session_dir():
     shutil.rmtree(d, ignore_errors=True)
 
 
-def make_agent(ws, session_dir, **config):
+def make_agent(ws, session_dir, transcript=None, **config):
     tracker = BudgetTracker(None)
     agent = ClaudeCodeAgent(AgentConfig(**config), ECOSYSTEMS["python"], COMPONENT, ws, "installed", tracker,
-                            ws.root.parent / "transcript.jsonl", session_dir)
+                            transcript or ws.root.parent / "transcript.jsonl", session_dir)
     return agent, tracker
 
 
@@ -108,6 +108,16 @@ def test_full_session_through_mcp(ws, session_dir, fake_claude, monkeypatch):
         assert command_output.strip().splitlines()[-1] != "0"  # ran as the sandbox user
     transcript = (ws.root.parent / "transcript.jsonl").read_text()
     assert '"tool": "write_file"' in transcript and '"tool": "submit_report"' in transcript
+
+
+def test_relative_transcript_path(ws, session_dir, fake_claude, monkeypatch):
+    # `run --out results` gives a relative path, while the MCP server runs in the session
+    # directory; this broke every tool call in the first real run.
+    monkeypatch.chdir(ws.root.parent)
+    agent, _ = make_agent(ws, session_dir, transcript=Path("transcript.jsonl"))
+    outcome = agent.run()
+    assert outcome.status == "completed", outcome.detail
+    assert '"tool": "write_file"' in (ws.root.parent / "transcript.jsonl").read_text()
 
 
 def test_missing_report(ws, session_dir, fake_claude, monkeypatch):

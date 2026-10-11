@@ -96,8 +96,12 @@ class ToolBox:
         if self.transcript is None:
             return
         entry["time"] = round(time.time(), 1)
-        with self._lock, self.transcript.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        try:
+            with self._lock, self.transcript.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+        except OSError:
+            # A broken transcript must never break the tool call itself.
+            log.warning("cannot write transcript %s", self.transcript, exc_info=True)
 
 
 def validate_report(report: dict) -> list[str]:

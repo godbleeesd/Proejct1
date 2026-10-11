@@ -82,7 +82,8 @@ class ClaudeCodeAgent:
             "ecosystem": self.ecosystem.key,
             "fuzz_seconds": self.config.fuzz_seconds,
             "command_timeout": self.config.command_timeout,
-            "transcript": str(self.transcript),
+            # The server runs in the session directory, so relative paths would break.
+            "transcript": str(self.transcript.resolve()),
             "state": str(d / "state.json"),
             "warn_after_calls": max(1, self.config.max_turns - 3),
             "label": self.component.display_name,

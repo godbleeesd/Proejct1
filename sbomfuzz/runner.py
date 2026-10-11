@@ -77,6 +77,8 @@ def select(components: list[Component], config: RunConfig) -> list[Component]:
 def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
     components = select(load_cyclonedx(config.sbom), config)
     started = datetime.now(timezone.utc)
+    # Absolute paths: the MCP server and Claude Code run in other working directories.
+    config.out, config.workdir = config.out.resolve(), config.workdir.resolve()
     config.out.mkdir(parents=True, exist_ok=True)
     config.workdir.mkdir(parents=True, exist_ok=True)
 
