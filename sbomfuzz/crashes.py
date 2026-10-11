@@ -28,6 +28,7 @@ _PY_FRAME = re.compile(r'^\s*File "([^"]+)", line (\d+), in (\S+)', re.MULTILINE
 _JAVA_EXC = re.compile(r"== Java Exception: ([\w.$]+)(?::\s*(.*))?")
 _JAVA_FRAME = re.compile(r"^\s+at ([\w.$<>]+)\(([^)]*)\)", re.MULTILINE)
 _NATIVE_FRAME = re.compile(r"^\s+#\d+ 0x[0-9a-f]+ in (\S+) (\S+)", re.MULTILINE)
+_DRIVER_FRAME = re.compile(r"^\s+#\d+ 0x[0-9a-f]+ (?:in (?:fuzzer::|main |_start |__libc_start)|\s*\(/lib/)")
 _LIBFUZZER_ERROR = re.compile(r"==\d+== ?ERROR: libFuzzer: ([\w -]+)")
 
 
@@ -37,16 +38,18 @@ def classify(output: str) -> CrashInfo:
     if "out-of-memory" in output:
         return _info("out-of-memory", "out-of-memory", "input exceeded the memory limit", output, "out-of-memory")
 
+    # UBSan first: it reports (and with halt_on_error stops) before any later ASan crash, and
+    # its own SUMMARY line carries no "ERROR:" header to anchor the stack excerpt on.
+    m = _UBSAN.search(output)
+    if m:
+        where, message = _short(m.group(1)), m.group(2).strip()
+        return _info("undefined-behavior", f"undefined-behavior {where}", f"{where}: {message}", output, m.group(0))
+
     m = _SANITIZER_SUMMARY.search(output)
     if m:
         kind = m.group(2)
         where = " ".join(_short(t) if "/" in t else t for t in (m.group(3) or "").split())
         return _info(kind, f"{kind} {where}".strip(), f"{m.group(1)}: {kind} {where}".strip(), output, "ERROR:")
-
-    m = _UBSAN.search(output)
-    if m:
-        message = m.group(2)
-        return _info("undefined-behavior", f"ub {m.group(1)}", f"{m.group(1)}: {message}", output, "runtime error")
 
     m = _PY_EXC.search(output)
     if m:
@@ -80,8 +83,9 @@ def classify(output: str) -> CrashInfo:
 def _info(kind: str, signature: str, summary: str, output: str, anchor: str | None) -> CrashInfo:
     start = output.find(anchor) if anchor else -1
     text = output[start:] if start >= 0 else output[-4000:]
-    stack = "\n".join(text.splitlines()[:STACK_LINES])
-    return CrashInfo(kind, signature, summary, stack)
+    # Frames of the fuzzer driver and libc below the harness add nothing to a report.
+    lines = [line for line in text.splitlines() if not _DRIVER_FRAME.search(line)]
+    return CrashInfo(kind, signature, summary, "\n".join(lines[:STACK_LINES]))
 
 
 def _short(path: str) -> str:
