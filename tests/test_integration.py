@@ -1,10 +1,15 @@
 """Runs the real toolchains. Meant for the Docker image (CI runs them there)."""
 
+import json
 import shutil
+import sys
+import tempfile
+from pathlib import Path
 
 import pytest
 
-from sbomfuzz import sandbox
+from sbomfuzz import campaign, claude_code, sandbox
+from sbomfuzz.campaign import run_campaign
 from sbomfuzz.ecosystems import ECOSYSTEMS
 from sbomfuzz.fetch import fetch
 from sbomfuzz.sbom import Component
@@ -18,17 +23,28 @@ def needs(tool):
 
 def write(ws, relative, content):
     path = ws.root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
-    sandbox.give_to_sandbox(path)
+    sandbox.give_to_sandbox(path.parent)
 
 
-PY_HARNESS = """\
+def seeds(ws, name, *contents):
+    paths = []
+    for i, content in enumerate(contents, 1):
+        write(ws, f"corpus/{name}/seed-{i}", content)
+        paths.append(ws.root / f"corpus/{name}/seed-{i}")
+    return paths
+
+
+PY_TWO_BUGS = """\
 import sys
 import atheris
 
 def TestOneInput(data):
     if data[:1] == b"B":
-        raise RuntimeError("planted bug")
+        raise RuntimeError("first planted bug")
+    if data[:1] == b"C":
+        raise ValueError("second planted bug")
 
 atheris.Setup(sys.argv, TestOneInput)
 atheris.Fuzz()
@@ -49,11 +65,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 }
 """
 
-C_CLEAN_HARNESS = """\
-#include <stdint.h>
-#include <stddef.h>
-int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) { return 0; }
-"""
+BUILD_SH = "set -e\nmkdir -p out\nclang -g -O1 -fsanitize=fuzzer,address,undefined harnesses/fuzz_demo.c -o out/fuzz_demo\n"
 
 JAVA_HARNESS = """\
 import com.code_intelligence.jazzer.api.FuzzedDataProvider;
@@ -68,64 +80,109 @@ public class DemoFuzzer {
 """
 
 
-def test_atheris_finds_planted_bug(ws):
+def test_python_validation_and_campaign(ws, monkeypatch):
     pytest.importorskip("atheris")
-    write(ws, "harnesses/fuzz_demo.py", PY_HARNESS)
-    run = ECOSYSTEMS["python"].fuzz(ws, "harnesses/fuzz_demo.py", 60)
-    assert run.status == "crash", run.to_text()
-    assert run.crash_files
-    assert "planted bug" in run.excerpt
+    # Each restart hits one of the two bugs at random; allow enough repeats to see both.
+    monkeypatch.setattr(campaign, "MAX_DUPLICATE_RESTARTS", 30)
+    py = ECOSYSTEMS["python"]
+    write(ws, "harnesses/fuzz_demo.py", PY_TWO_BUGS)
 
+    ok, text = py.validate(ws, "harnesses/fuzz_demo.py", seeds(ws, "demo", "a", "x", "zz"))
+    assert ok, text
+    ok, text = py.validate(ws, "harnesses/fuzz_demo.py", seeds(ws, "demo", "a", "Boom", "zz"))
+    assert not ok and "first planted bug" in text  # a crashing seed fails validation
+    seeds(ws, "demo", "a", "x", "zz")
 
-def build_c(ws, source, binary):
-    write(ws, f"harnesses/{binary}.c", source)
-    built = sandbox.run(["clang", "-g", "-O1", "-fsanitize=fuzzer,address,undefined",
-                         f"harnesses/{binary}.c", "-o", binary], cwd=ws.root, timeout=300)
-    assert built.ok, built.output
+    result = run_campaign(ws, py, "demo", "harnesses/fuzz_demo.py", 60)
+    kinds = sorted(c.kind for c in result.crashes)
+    assert kinds == ["RuntimeError", "ValueError"], result.to_dict()  # fuzzing continued past the first crash
+    assert result.status == "crashes" and result.runs >= 2
+    crash = result.crashes[0]
+    assert crash.crash_file.startswith("crashes/") and crash.reproduction.startswith("PYTHONPATH=site python3 ")
+    replay = sandbox.run(crash.reproduction, cwd=ws.root, timeout=60)
+    assert "planted bug" in replay.output
 
 
 @needs("clang")
-def test_libfuzzer_finds_heap_overflow(ws):
-    build_c(ws, C_HARNESS, "fuzz_demo")
-    run = ECOSYSTEMS["native"].fuzz(ws, "fuzz_demo", 60)
-    assert run.status == "crash", run.to_text()
-    assert "heap-buffer-overflow" in run.excerpt
-    assert run.crash_files
+def test_native_build_validation_and_campaign(ws):
+    native = ECOSYSTEMS["native"]
+    write(ws, "harnesses/fuzz_demo.c", C_HARNESS)
+    assert "does not exist" in native.build(ws)
+    write(ws, "harnesses/build.sh", BUILD_SH)
+    assert native.build(ws) is None
+
+    ok, text = native.validate(ws, "out/fuzz_demo", seeds(ws, "demo", "a", "x", "zz"))
+    assert ok, text
+    result = run_campaign(ws, native, "demo", "out/fuzz_demo", 30)
+    assert [c.kind for c in result.crashes] == ["heap-buffer-overflow"], result.to_dict()
+    assert "LLVMFuzzerTestOneInput" in result.crashes[0].signature
 
 
 @needs("clang")
-def test_libfuzzer_clean_run(ws):
-    build_c(ws, C_CLEAN_HARNESS, "fuzz_clean")
-    run = ECOSYSTEMS["native"].fuzz(ws, "fuzz_clean", 5)
-    assert run.status == "clean", run.to_text()
-    assert "DONE" in run.stats
+def test_native_clean_campaign(ws):
+    native = ECOSYSTEMS["native"]
+    write(ws, "harnesses/fuzz_demo.c", "#include <stdint.h>\n#include <stddef.h>\n"
+          "int LLVMFuzzerTestOneInput(const uint8_t *d, size_t n) { return 0; }\n")
+    write(ws, "harnesses/build.sh", BUILD_SH)
+    assert native.build(ws) is None
+    seeds(ws, "demo", "a", "b", "c")
+    result = run_campaign(ws, native, "demo", "out/fuzz_demo", 6)
+    assert result.status == "clean" and result.runs == 1 and result.executions > 0, result.to_dict()
 
 
 @needs("jazzer")
-def test_jazzer_finds_planted_bug(ws):
-    write(ws, "harnesses/DemoFuzzer.java", JAVA_HARNESS)
-    run = ECOSYSTEMS["java"].fuzz(ws, "harnesses/DemoFuzzer.java", 90)
-    assert run.status == "crash", run.to_text()
-    assert "IllegalStateException" in run.excerpt
-    assert run.crash_files
-
-
-@needs("jazzer")
-def test_jazzer_reports_compile_errors(ws):
+def test_java_validation_and_campaign(ws):
+    java = ECOSYSTEMS["java"]
     write(ws, "harnesses/Broken.java", "public class Broken { int x = ; }")
-    run = ECOSYSTEMS["java"].fuzz(ws, "harnesses/Broken.java", 10)
-    assert run.status == "error"
-    assert "javac failed" in run.excerpt
+    ok, text = java.validate(ws, "harnesses/Broken.java", seeds(ws, "broken", "a", "b", "c"))
+    assert not ok and "javac failed" in text
+
+    write(ws, "harnesses/DemoFuzzer.java", JAVA_HARNESS)
+    ok, text = java.validate(ws, "harnesses/DemoFuzzer.java", seeds(ws, "demo", "a", "x", "z"))
+    assert ok, text
+    result = run_campaign(ws, java, "demo", "harnesses/DemoFuzzer.java", 60)
+    assert [c.kind for c in result.crashes] == ["java.lang.IllegalStateException"], result.to_dict()
 
 
 @pytest.mark.skipif(not sandbox.sandbox_active(), reason="needs root and the sandbox user")
 def test_commands_run_unprivileged_without_api_key(ws, monkeypatch):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-secret")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-test-secret")
     result = sandbox.run("id -u; env; cat /proc/1/environ", cwd=ws.root, timeout=30)
-    lines = result.output.splitlines()
-    assert lines[0] != "0"
+    assert result.output.splitlines()[0] != "0"
     assert "sk-test-secret" not in result.output
     assert "Permission denied" in result.output
+
+
+def test_full_pipeline(monkeypatch, tmp_path):
+    """SBOM -> fetch from PyPI -> (fake) Claude writes and fixes a harness -> fuzzing -> report."""
+    pytest.importorskip("atheris")
+    from sbomfuzz.prompts import AgentConfig
+    from sbomfuzz.runner import RunConfig, run
+
+    monkeypatch.setattr(claude_code, "CLAUDE_CMD", [sys.executable, str(Path(__file__).parent / "fake_claude.py")])
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(tmp_path / "fake.log"))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
+    sbom = tmp_path / "bom.json"
+    sbom.write_text(json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [
+        {"type": "library", "name": "toml", "version": "0.10.2", "purl": "pkg:pypi/toml@0.10.2"},
+        {"type": "library", "name": "left-pad", "version": "1.3.0", "purl": "pkg:npm/left-pad@1.3.0"}]}))
+    work = Path(tempfile.mkdtemp(prefix="sbomfuzz-work-"))
+    work.chmod(0o755)
+    try:
+        results, _ = run(RunConfig(sbom=sbom, out=tmp_path / "out", workdir=work, agent=AgentConfig(),
+                                   fuzz_seconds=20))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+    toml_result, npm_result = results
+    assert npm_result.status == "skipped"
+    assert toml_result.status == "completed", toml_result.detail
+    assert [c["kind"] for _, c in toml_result.crashes] == ["RuntimeError"]
+    report = (tmp_path / "out" / "report.md").read_text()
+    assert "unique crashes: 1" in report and "RuntimeError in `toml@0.10.2`" in report
+    artifacts = Path(toml_result.artifacts)
+    assert (artifacts / "harnesses" / "fuzz_demo.py").exists()
+    assert sorted(p.name for p in (artifacts / "seeds" / "demo").iterdir()) == ["seed-1", "seed-2", "seed-3"]
 
 
 def component(**kw):

@@ -1,8 +1,8 @@
-"""Subscription backend: drives the Claude Code CLI (`claude -p`) with the fuzzing tools served over MCP.
+"""Harness generation with Claude Code (`claude -p`) on a Claude subscription.
 
 Authenticates with CLAUDE_CODE_OAUTH_TOKEN, the long-lived token `claude setup-token` creates
 for a Claude Pro/Max/Team/Enterprise subscription. Claude Code's own tools are disabled; the
-agent can only use sbomfuzz's MCP tools, which run everything in the sandbox.
+model can only use sbomfuzz's MCP tools, which run everything in the sandbox.
 """
 
 from __future__ import annotations
@@ -14,13 +14,13 @@ import re
 import shlex
 import subprocess
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from .agent import AgentOutcome
 from .ecosystems import Ecosystem
 from .prompts import AgentConfig, system_prompt, task_prompt
 from .sbom import Component
-from .usage import BudgetTracker, Usage
+from .usage import Usage
 from .workspace import Workspace
 
 log = logging.getLogger(__name__)
@@ -37,15 +37,26 @@ class ClaudeCodeAuthError(RuntimeError):
     pass
 
 
-class ClaudeCodeAgent:
+@dataclass
+class GenerationOutcome:
+    # done (harnesses accepted, possibly none) | incomplete | usage_limit | error
+    status: str
+    detail: str = ""
+    harnesses: list[dict] = field(default_factory=list)
+    attempts: int = 0
+    validation: list[dict] = field(default_factory=list)
+    usage: Usage = field(default_factory=Usage)
+    turns: int = 0
+
+
+class HarnessGenerator:
     def __init__(self, config: AgentConfig, ecosystem: Ecosystem, component: Component, ws: Workspace,
-                 fetch_detail: str, tracker: BudgetTracker, transcript: Path, session_dir: Path):
+                 fetch_detail: str, transcript: Path, session_dir: Path):
         self.config = config
         self.ecosystem = ecosystem
         self.component = component
         self.ws = ws
         self.fetch_detail = fetch_detail
-        self.tracker = tracker
         self.transcript = transcript
         # Holds prompts, MCP config and state; root-only and outside any sandbox-writable
         # directory, so code running in the sandbox cannot tamper with them.
@@ -80,9 +91,11 @@ class ClaudeCodeAgent:
         server_config = {
             "workspace": str(self.ws.root),
             "ecosystem": self.ecosystem.key,
-            "fuzz_seconds": self.config.fuzz_seconds,
+            "max_harnesses": self.config.max_harnesses,
+            "max_attempts": self.config.max_attempts,
             "command_timeout": self.config.command_timeout,
-            "transcript": str(self.transcript),
+            # The server runs in the session directory, so relative paths would break.
+            "transcript": str(self.transcript.resolve()),
             "state": str(d / "state.json"),
             "warn_after_calls": max(1, self.config.max_turns - 3),
             "label": self.component.display_name,
@@ -98,20 +111,19 @@ class ClaudeCodeAgent:
 
     def env(self) -> dict[str, str]:
         env = dict(os.environ)
-        if env.get("CLAUDE_CODE_OAUTH_TOKEN"):
-            # An API key outranks the OAuth token in Claude Code; drop it so the subscription is used.
-            env.pop("ANTHROPIC_API_KEY", None)
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
-        tool_timeout = max(self.config.command_timeout, self.config.fuzz_seconds + 300) + 120
-        env["MCP_TOOL_TIMEOUT"] = str(tool_timeout * 1000)
+        # An API key outranks the OAuth token in Claude Code; drop it so the subscription is used.
+        env.pop("ANTHROPIC_API_KEY", None)
+        env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        # Validation builds and runs harnesses (a native build can take a while).
+        env["MCP_TOOL_TIMEOUT"] = str((self.config.command_timeout + 900) * 1000)
         env.setdefault("MCP_TIMEOUT", "60000")
         env.setdefault("DISABLE_AUTOUPDATER", "1")
         return env
 
-    def run(self) -> AgentOutcome:
+    def run(self) -> GenerationOutcome:
         self.prepare()
-        outcome = AgentOutcome(status="incomplete", detail="the agent did not submit a report")
-        overall = self.config.max_turns * (self.config.fuzz_seconds + 180) + 1800
+        outcome = GenerationOutcome(status="incomplete", detail="the model did not submit harnesses")
+        overall = self.config.max_turns * 600 + 1800
         try:
             # cwd is the private session directory, never the sandbox-writable workspace:
             # Claude Code loads configuration and CLAUDE.md from its working directory.
@@ -128,13 +140,11 @@ class ClaudeCodeAgent:
         self._load_state(outcome)
         self._record_usage(outcome, result)
         text = str(result.get("result") or "")
-        if result.get("result"):
-            outcome_log = {"type": "text", "text": text[:4000]}
+        if text:
             with self.transcript.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(outcome_log, ensure_ascii=False) + "\n")
+                f.write(json.dumps({"type": "text", "text": text[:4000]}, ensure_ascii=False) + "\n")
 
-        if outcome.report is not None:
-            outcome.status, outcome.detail = "completed", ""
+        if outcome.status == "done":
             return outcome
 
         problem = text or proc.stderr.strip() or f"claude exited with code {proc.returncode}"
@@ -144,23 +154,29 @@ class ClaudeCodeAgent:
             if _USAGE_LIMIT.search(problem):
                 outcome.status, outcome.detail = "usage_limit", problem.splitlines()[0][:300]
             elif result.get("subtype") == "error_max_turns":
-                outcome.detail = f"turn limit ({self.config.max_turns}) reached without a report"
+                outcome.detail = f"turn limit ({self.config.max_turns}) reached before the harnesses were accepted"
             else:
                 outcome.status, outcome.detail = "error", problem[:500]
+        elif text:
+            # The model ended without submitting, e.g. because the component is not native code.
+            outcome.detail = text.strip().splitlines()[0][:300]
         return outcome
 
-    def _load_state(self, outcome: AgentOutcome) -> None:
+    def _load_state(self, outcome: GenerationOutcome) -> None:
         try:
             state = json.loads((self.session_dir / "state.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
-        outcome.report = state.get("report")
-        outcome.fuzz_runs = state.get("fuzz_runs") or []
+        outcome.attempts = state.get("attempts") or 0
+        outcome.validation = state.get("validation") or []
+        if state.get("accepted") is not None:
+            outcome.status, outcome.detail = "done", ""
+            outcome.harnesses = state["accepted"]
 
-    def _record_usage(self, outcome: AgentOutcome, result: dict) -> None:
+    def _record_usage(self, outcome: GenerationOutcome, result: dict) -> None:
         outcome.turns = int(result.get("num_turns") or 0)
         u = result.get("usage") or {}
-        usage = Usage(
+        outcome.usage = Usage(
             input_tokens=int(u.get("input_tokens") or 0),
             output_tokens=int(u.get("output_tokens") or 0),
             cache_read_tokens=int(u.get("cache_read_input_tokens") or 0),
@@ -168,8 +184,6 @@ class ClaudeCodeAgent:
             # Claude Code's API-equivalent estimate; a subscription is not billed per token.
             cost_usd=float(result["total_cost_usd"]) if result.get("total_cost_usd") is not None else None,
         )
-        outcome.usage = usage
-        self.tracker.add(usage)
 
 
 def parse_result(stdout: str) -> dict:

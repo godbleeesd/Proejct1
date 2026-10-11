@@ -1,47 +1,44 @@
 import json
 
-import pytest
+from sbomfuzz.report import ComponentResult, render_markdown, write_json
+from sbomfuzz.usage import Usage
 
-from sbomfuzz.report import ComponentResult, render_markdown, severity_at_least, write_json
-from sbomfuzz.usage import Usage, from_response
+META = {"sbom": "bom.json", "started": "s", "finished": "f", "model": "default", "effort": "high",
+        "fuzz_seconds_per_harness": 600}
 
-META = {"sbom": "bom.json", "started": "s", "finished": "f", "model": "claude-opus-5-5", "effort": "high"}
+CRASH = {"kind": "IndexError", "signature": "IndexError toml/decoder.py:207 in load_line",
+         "summary": "IndexError: list index out of range (toml/decoder.py:207 in load_line)",
+         "stack": "=== Uncaught Python exception: ===\nIndexError: list index out of range",
+         "crash_file": "crashes/crash-1", "reproduction": "PYTHONPATH=site python3 harnesses/fuzz_loads.py crashes/crash-1",
+         "count": 2}
 
 
 def make_results():
-    report = {
-        "summary": "Fuzzed the parser | found one bug.",
-        "harnesses": [{"path": "harnesses/fuzz_parse.py", "target_api": "parse()", "outcome": "found_crashes", "notes": ""}],
-        "findings": [
-            {"title": "IndexError on truncated input", "verdict": "confirmed_bug", "severity": "medium",
-             "harness": "harnesses/fuzz_parse.py", "crash_file": "crashes/crash-1",
-             "description": "Out-of-range read.", "reproduction": "python harnesses/fuzz_parse.py crashes/crash-1"},
-            {"title": "Harness passed None", "verdict": "harness_issue", "severity": "info",
-             "harness": "harnesses/fuzz_parse.py", "crash_file": "", "description": "", "reproduction": ""},
-        ],
-        "limitations": "Only parse() was covered.",
-    }
+    harness = {"name": "loads", "source": "harnesses/fuzz_loads.py", "target": "harnesses/fuzz_loads.py",
+               "target_api": "toml.loads | dumps", "description": "", "seeds": [], "status": "crashes",
+               "fuzz_seconds": 600.0, "runs": 4, "executions": 123456, "last_stats": "#123456 DONE cov: 787",
+               "error": "", "crashes": [CRASH]}
+    validation = [{"attempt": 1, "build_error": None,
+                   "harnesses": [{"name": "loads", "ok": True, "detail": ""},
+                                 {"name": "dumps", "ok": False, "detail": "SyntaxError: invalid syntax"}]}]
     return [
         ComponentResult({"name": "toml", "version": "0.10.2", "ecosystem": "python", "purl": "pkg:pypi/toml@0.10.2"},
-                        "completed", report=report),
+                        "completed", harnesses=[harness], attempts=1, validation=validation, turns=12),
         ComponentResult({"name": "lodash", "version": "4.17.21", "ecosystem": None, "purl": "pkg:npm/lodash@4.17.21"},
                         "skipped", "unsupported ecosystem (npm)"),
     ]
 
 
-def test_only_bug_verdicts_count_as_bugs():
-    results = make_results()
-    assert [f["title"] for f in results[0].bugs] == ["IndexError on truncated input"]
-    assert results[1].bugs == []
-
-
 def test_markdown_report():
     md = render_markdown(META, make_results(), Usage())
-    assert "bugs found: 1" in md
-    assert "### [MEDIUM] IndexError on truncated input" in md
-    assert "Fuzzed the parser \\| found one bug." in md  # pipes escaped inside the table
-    assert "Not a bug (harness_issue): Harness passed None" in md
+    assert "unique crashes: 1" in md
+    assert "### 1. IndexError in `toml@0.10.2`" in md
+    assert "PYTHONPATH=site python3 harnesses/fuzz_loads.py crashes/crash-1" in md
+    assert "hit 2 time(s)" in md
+    assert "123,456" in md
+    assert "`dumps`: dropped, failed validation: SyntaxError" in md
     assert "unsupported ecosystem (npm)" in md
+    assert "toml.loads \\| dumps" not in md  # pipes only need escaping inside table cells
 
 
 def test_json_report(tmp_path):
@@ -50,21 +47,5 @@ def test_json_report(tmp_path):
     data = json.loads(path.read_text())
     assert data["usage"]["input_tokens"] == 5
     assert [c["status"] for c in data["components"]] == ["completed", "skipped"]
-
-
-def test_severity_threshold():
-    assert severity_at_least("high", "medium")
-    assert severity_at_least("medium", "medium")
-    assert not severity_at_least("low", "medium")
-    assert not severity_at_least("bogus", "low")
-
-
-def test_cost_estimate():
-    class U:
-        input_tokens = 1_000_000
-        output_tokens = 100_000
-        cache_read_input_tokens = 1_000_000
-        cache_creation_input_tokens = 0
-
-    assert from_response("claude-opus-5-5", U()).cost_usd == pytest.approx(4.0 + 2.0 + 0.2)
-    assert from_response("some-unknown-model", U()).cost_usd is None
+    assert data["components"][0]["harnesses"][0]["crashes"][0]["count"] == 2
+    assert data["components"][0]["generation"]["attempts"] == 1

@@ -5,11 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sbomfuzz"
 version = "0.1.0"
-description = "AI-assisted fuzz testing of the components listed in a CycloneDX SBOM"
+description = "Fuzz the components of a CycloneDX SBOM: Claude writes the harnesses, the fuzzers do the rest"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "anthropic>=1.13,<2",
     "packageurl-python>=0.17",
     "mcp>=2.3,<3",
 ]

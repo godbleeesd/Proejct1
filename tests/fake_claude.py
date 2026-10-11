@@ -1,8 +1,12 @@
 """Stands in for the `claude` CLI in tests.
 
-Starts the MCP server from --mcp-config exactly as Claude Code would, plays a short scripted
-session against it, and prints a result object like `claude -p --output-format json`.
-FAKE_CLAUDE_MODE selects the scenario: report (default), no_report, usage_limit, auth_error.
+Starts the MCP server from --mcp-config exactly as Claude Code would, plays a scripted
+harness-writing session against it, and prints a result object like
+`claude -p --output-format json`. FAKE_CLAUDE_MODE selects the scenario:
+  fix (default)  - submit a broken harness, read the validation error, fix it, resubmit
+  always_broken  - keep submitting a broken harness until attempts run out
+  no_submit      - explore, then stop without submitting
+  usage_limit, auth_error - fail like Claude Code does in those cases
 """
 
 import asyncio
@@ -13,17 +17,32 @@ import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-REPORT = {
-    "summary": "Fuzzed parse().",
-    "harnesses": [{"path": "harnesses/fuzz_x.py", "target_api": "parse", "outcome": "ran_clean", "notes": ""}],
-    "findings": [{"title": "IndexError", "verdict": "likely_bug", "severity": "low", "harness": "harnesses/fuzz_x.py",
-                  "crash_file": "", "description": "d", "reproduction": "r"}],
-    "limitations": "",
+GOOD = '''\
+import sys
+import atheris
+
+def TestOneInput(data):
+    if data[:1] == b"B":
+        raise RuntimeError("planted bug")
+
+atheris.Setup(sys.argv, TestOneInput)
+atheris.Fuzz()
+'''
+BROKEN = GOOD.replace("def TestOneInput(data):", "def TestOneInput(data)")  # syntax error
+
+HARNESS = {
+    "name": "demo",
+    "source": "harnesses/fuzz_demo.py",
+    "target": "harnesses/fuzz_demo.py",
+    "target_api": "demo",
+    "description": "planted bug on inputs starting with B",
+    "seeds": [{"content": "a = 1", "encoding": "text"}, {"content": "x", "encoding": "text"},
+              {"content": "AAEC", "encoding": "base64"}],
 }
 
 
 def result(**kw):
-    base = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 4, "result": "Done.",
+    base = {"type": "result", "subtype": "success", "is_error": False, "num_turns": 5, "result": "Done.",
             "total_cost_usd": 0.25,
             "usage": {"input_tokens": 1000, "output_tokens": 200, "cache_read_input_tokens": 5000,
                       "cache_creation_input_tokens": 300}}
@@ -31,27 +50,47 @@ def result(**kw):
     return base
 
 
-async def session(server: dict, submit: bool) -> None:
+async def call(s, name, args):
+    out = await s.call_tool(name, args)
+    return out.content[0].text
+
+
+async def session(server: dict, mode: str) -> None:
     params = StdioServerParameters(command=server["command"], args=server["args"], env=dict(os.environ))
     async with stdio_client(params) as (read, write):
         async with ClientSession(read, write) as s:
             await s.initialize()
             names = sorted(t.name for t in (await s.list_tools()).tools)
-            assert names == ["run_command", "run_fuzzer", "submit_report", "write_file"], names
-            await s.call_tool("write_file", {"path": "harnesses/fuzz_x.py", "content": "print('hi')\n"})
-            out = await s.call_tool("run_command", {"command": "cat harnesses/fuzz_x.py; id -u", "timeout_seconds": 30})
-            text = out.content[0].text
-            assert "print('hi')" in text, text
+            assert names == ["run_command", "submit_harnesses", "write_file"], names
+            text = await call(s, "run_command", {"command": "id -u", "timeout_seconds": 30})
             with open(os.environ["FAKE_CLAUDE_LOG"], "w") as f:
                 f.write(text)
-            if submit:
-                out = await s.call_tool("submit_report", REPORT)
-                assert out.content[0].text == "Report received.", out.content[0].text
+            if mode == "no_submit":
+                return
+
+            # Shape errors are rejected without using up an attempt.
+            text = await call(s, "submit_harnesses", {"harnesses": [{**HARNESS, "seeds": HARNESS["seeds"][:2]}]})
+            assert "not counted as an attempt" in text, text
+
+            await call(s, "write_file", {"path": HARNESS["source"], "content": BROKEN})
+            text = await call(s, "submit_harnesses", {"harnesses": [HARNESS]})
+            assert "FAILED" in text and "SyntaxError" in text, text
+            if mode == "always_broken":
+                for _ in range(5):
+                    text = await call(s, "submit_harnesses", {"harnesses": [HARNESS]})
+                    if "End your turn" in text:
+                        break
+                assert "No attempts left" in text or "already accepted" in text, text
+                return
+
+            await call(s, "write_file", {"path": HARNESS["source"], "content": GOOD})
+            text = await call(s, "submit_harnesses", {"harnesses": [HARNESS]})
+            assert "accepted for fuzzing" in text, text
 
 
 def main() -> None:
     args = sys.argv[1:]
-    mode = os.environ.get("FAKE_CLAUDE_MODE", "report")
+    mode = os.environ.get("FAKE_CLAUDE_MODE", "fix")
     with open(args[args.index("--mcp-config") + 1]) as f:
         server = json.load(f)["mcpServers"]["sbomfuzz"]
 
@@ -64,10 +103,10 @@ def main() -> None:
                                 result="Claude AI usage limit reached|1760000000")))
         sys.exit(1)
 
-    asyncio.run(session(server, submit=mode == "report"))
-    if mode == "no_report":
-        print(json.dumps(result(is_error=True, subtype="error_max_turns", result="")))
-        sys.exit(1)
+    asyncio.run(session(server, mode))
+    if mode == "no_submit":
+        print(json.dumps(result(result="This component is not native code; no harnesses written.")))
+        return
     print(json.dumps(result()))
 
 

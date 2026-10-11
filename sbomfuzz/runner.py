@@ -1,4 +1,5 @@
-"""Fuzzing every selected component of an SBOM and collecting the results."""
+"""The pipeline: for each SBOM component, download it, let Claude write harnesses and seeds,
+then fuzz every accepted harness for a fixed time and collect the crashes."""
 
 from __future__ import annotations
 
@@ -13,23 +14,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-import anthropic
-
 from . import report
-from .agent import FuzzAgent
-from .claude_code import ClaudeCodeAgent, ClaudeCodeAuthError
+from .campaign import run_campaign
+from .claude_code import ClaudeCodeAuthError, HarnessGenerator
 from .ecosystems import ECOSYSTEMS
 from .fetch import FetchError, fetch
 from .prompts import AgentConfig
 from .report import ComponentResult
 from .sbom import Component, load_cyclonedx
-from .tools import ToolBox
-from .usage import BudgetTracker
+from .usage import UsageTotal
 from .workspace import Workspace
 
 log = logging.getLogger(__name__)
-
-BACKENDS = ("api", "subscription")
 
 
 @dataclass
@@ -37,13 +33,12 @@ class RunConfig:
     sbom: Path
     out: Path
     workdir: Path
-    backend: str = "api"  # api: Messages API with ANTHROPIC_API_KEY; subscription: Claude Code CLI
     agent: AgentConfig = field(default_factory=AgentConfig)
+    fuzz_seconds: int = 600  # per harness
     ecosystems: list[str] = field(default_factory=lambda: list(ECOSYSTEMS))
     include: list[str] = field(default_factory=list)  # glob patterns on name / purl
     limit: int | None = None
     jobs: int = 1
-    budget_usd: float | None = None
     keep_workdirs: bool = False
 
 
@@ -52,8 +47,7 @@ class _Shared:
     """State shared by all components of a run."""
 
     config: RunConfig
-    tracker: BudgetTracker
-    client: anthropic.Anthropic | None
+    usage: UsageTotal
     total: int
     stop_reason: str | None = None  # set when no further component should start
     started: int = 0
@@ -77,6 +71,8 @@ def select(components: list[Component], config: RunConfig) -> list[Component]:
 def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
     components = select(load_cyclonedx(config.sbom), config)
     started = datetime.now(timezone.utc)
+    # Absolute paths: the MCP server and Claude Code run in other working directories.
+    config.out, config.workdir = config.out.resolve(), config.workdir.resolve()
     config.out.mkdir(parents=True, exist_ok=True)
     config.workdir.mkdir(parents=True, exist_ok=True)
 
@@ -93,9 +89,8 @@ def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
         else:
             todo.append(c)
 
-    client = anthropic.Anthropic(max_retries=5) if config.backend == "api" else None
-    shared = _Shared(config, BudgetTracker(config.budget_usd), client, len(todo))
-    log.info("%d components in SBOM, %d to fuzz (backend: %s)", len(components), len(todo), config.backend)
+    shared = _Shared(config, UsageTotal(), len(todo))
+    log.info("%d components in SBOM, %d to fuzz", len(components), len(todo))
 
     def work(c: Component) -> None:
         results[c.key] = _process(c, shared)
@@ -114,14 +109,12 @@ def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
         "sbom": str(config.sbom),
         "started": started.isoformat(timespec="seconds"),
         "finished": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "backend": config.backend,
         "model": config.agent.model or "default",
         "effort": config.agent.effort,
-        "fuzz_seconds_per_run": config.agent.fuzz_seconds,
+        "fuzz_seconds_per_harness": config.fuzz_seconds,
     }
-    total = shared.tracker.total
-    report.write_json(config.out / "report.json", meta, ordered, total)
-    (config.out / "report.md").write_text(report.render_markdown(meta, ordered, total), encoding="utf-8")
+    report.write_json(config.out / "report.json", meta, ordered, shared.usage.total)
+    (config.out / "report.md").write_text(report.render_markdown(meta, ordered, shared.usage.total), encoding="utf-8")
     _match_owner(config.out)
     return ordered, meta
 
@@ -130,13 +123,9 @@ def _process(c: Component, shared: _Shared) -> ComponentResult:
     config = shared.config
     tag = shared.next_tag()
     result = ComponentResult(c.to_dict(), "error")
-    if shared.stop_reason is None and shared.tracker.exhausted():
-        shared.stop_reason = "budget_exhausted"
     if shared.stop_reason:
         result.status = shared.stop_reason
-        result.detail = {"budget_exhausted": "the run's budget was used up before this component",
-                         "usage_limit": "the subscription usage limit was reached before this component"
-                         }.get(shared.stop_reason, "")
+        result.detail = "the subscription usage limit was reached before this component"
         log.info("%s %s: skipped (%s)", tag, c.display_name, shared.stop_reason)
         return result
 
@@ -146,8 +135,8 @@ def _process(c: Component, shared: _Shared) -> ComponentResult:
     ws = Workspace.create(ws_root)
     artifacts = config.out / "components" / c.slug
     artifacts.mkdir(parents=True, exist_ok=True)
-    transcript = artifacts / "transcript.jsonl"
     session_dir = _sessions_root() / c.slug
+    ecosystem = ECOSYSTEMS[c.ecosystem]
     try:
         log.info("%s %s (%s): downloading", tag, c.display_name, c.ecosystem)
         try:
@@ -157,26 +146,35 @@ def _process(c: Component, shared: _Shared) -> ComponentResult:
             log.warning("%s %s: download failed: %s", tag, c.display_name, str(e).splitlines()[0])
             return result
 
-        log.info("%s %s: agent started", tag, c.display_name)
-        ecosystem = ECOSYSTEMS[c.ecosystem]
-        if config.backend == "subscription":
-            agent = ClaudeCodeAgent(config.agent, ecosystem, c, ws, fetched.detail, shared.tracker, transcript,
-                                    session_dir)
-        else:
-            toolbox = ToolBox(ws, ecosystem, config.agent.fuzz_seconds, config.agent.command_timeout,
-                              transcript, c.display_name)
-            agent = FuzzAgent.for_component(shared.client, config.agent, ecosystem, c, ws, fetched.detail,
-                                            shared.tracker, toolbox)
-        outcome = agent.run()
-        result.status, result.detail, result.report = outcome.status, outcome.detail, outcome.report
-        result.usage, result.turns, result.fuzz_runs = outcome.usage, outcome.turns, outcome.fuzz_runs
-        if outcome.status == "usage_limit":
-            shared.stop_reason = "usage_limit"
-        cost = f"${outcome.usage.cost_usd:.2f}" if outcome.usage.cost_usd is not None else "n/a"
-        log.info("%s %s: %s, %d bug(s), %d turns, est. %s", tag, c.display_name, result.status,
-                 len(result.bugs), outcome.turns, cost)
+        log.info("%s %s: Claude is writing harnesses", tag, c.display_name)
+        generated = HarnessGenerator(config.agent, ecosystem, c, ws, fetched.detail, artifacts / "transcript.jsonl",
+                                     session_dir).run()
+        shared.usage.add(generated.usage)
+        result.usage, result.turns = generated.usage, generated.turns
+        result.attempts, result.validation = generated.attempts, generated.validation
+        if generated.status != "done":
+            result.status, result.detail = generated.status, generated.detail
+            if generated.status == "usage_limit":
+                shared.stop_reason = "usage_limit"
+            log.info("%s %s: harness generation %s: %s", tag, c.display_name, generated.status, generated.detail)
+            return result
+        if not generated.harnesses:
+            result.status = "no_harness"
+            result.detail = "no harness passed validation" if generated.attempts else "the model submitted no harnesses"
+            log.info("%s %s: %s", tag, c.display_name, result.detail)
+            return result
+
+        log.info("%s %s: %d harness(es) accepted, fuzzing each for %ss", tag, c.display_name,
+                 len(generated.harnesses), config.fuzz_seconds)
+        for h in generated.harnesses:
+            log.info("%s %s: fuzzing %s", tag, c.display_name, h["name"])
+            fuzzed = run_campaign(ws, ecosystem, h["name"], h["target"], config.fuzz_seconds)
+            result.harnesses.append({**h, **fuzzed.to_dict()})
+        result.status = "completed"
+        crashes = sum(len(h["crashes"]) for h in result.harnesses)
+        log.info("%s %s: done, %d unique crash(es)", tag, c.display_name, crashes)
         return result
-    except (anthropic.AuthenticationError, ClaudeCodeAuthError):
+    except ClaudeCodeAuthError:
         raise
     except Exception as e:
         log.exception("%s %s: failed", tag, c.display_name)
@@ -203,6 +201,11 @@ def _save_artifacts(ws: Workspace, dest: Path) -> None:
         src = ws.root / name
         if src.is_dir() and any(src.iterdir()):
             shutil.copytree(src, dest / name, symlinks=True, dirs_exist_ok=True)
+    # Only the seeds: the fuzzed corpus can be large.
+    for seed in ws.corpus.glob("*/seed-*"):
+        target = dest / "seeds" / seed.parent.name / seed.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(seed, target)
 
 
 def _match_owner(out: Path) -> None:
