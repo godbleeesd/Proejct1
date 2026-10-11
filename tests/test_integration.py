@@ -76,6 +76,12 @@ def test_atheris_finds_planted_bug(ws):
     assert run.crash_files
     assert "planted bug" in run.excerpt
 
+    # The agent may now "fix" its harness; the snapshot must still reproduce the crash.
+    assert run.harness_snapshot.startswith("crashes/snapshots/fuzz_demo-")
+    write(ws, "harnesses/fuzz_demo.py", PY_HARNESS.replace('raise RuntimeError("planted bug")', "return"))
+    replay = sandbox.run(["python3", run.harness_snapshot, run.crash_files[0]], cwd=ws.root, timeout=60)
+    assert "planted bug" in replay.output, replay.output
+
 
 def build_c(ws, source, binary):
     write(ws, f"harnesses/{binary}.c", source)

@@ -61,7 +61,8 @@ class ToolBox:
         run = self.ecosystem.fuzz(self.ws, target, seconds)
         with self._lock:
             self.fuzz_runs.append({"target": target, "seconds": seconds, "status": run.status,
-                                   "stats": run.stats, "crash_files": run.crash_files})
+                                   "stats": run.stats, "crash_files": run.crash_files,
+                                   "harness_snapshot": run.harness_snapshot})
         return run.to_text(), run.status == "error"
 
     def submit_report(self, report: dict) -> tuple[str, bool]:

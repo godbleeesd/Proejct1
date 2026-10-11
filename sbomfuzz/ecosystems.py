@@ -6,8 +6,10 @@ output format, so running and summarising them is mostly common code.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,6 +37,7 @@ class FuzzRun:
     crash_files: list[str] = field(default_factory=list)
     excerpt: str = ""
     duration: float = 0.0
+    harness_snapshot: str = ""  # copy of the harness version that found the crashes
 
     def to_text(self) -> str:
         lines = [f"status: {self.status}", f"duration: {self.duration:.0f}s"]
@@ -42,6 +45,9 @@ class FuzzRun:
             lines.append(f"last stats: {self.stats}")
         if self.crash_files:
             lines.append("new crash inputs: " + ", ".join(self.crash_files))
+        if self.harness_snapshot:
+            lines.append(f"harness snapshot: {self.harness_snapshot} (the exact harness version that found these "
+                         "crashes; use it in reproduction commands, since you may change the harness later)")
         lines += ["output:", self.excerpt]
         return "\n".join(lines)
 
@@ -66,6 +72,23 @@ def summarize(result: sandbox.CommandResult, new_crashes: list[str]) -> FuzzRun:
     return FuzzRun(status, stats[-1] if stats else "", new_crashes, excerpt, result.duration)
 
 
+def snapshot_harness(ws: Workspace, harness: Path) -> Path:
+    """Copy the harness (source or fuzzer binary) to crashes/snapshots/, named by content hash.
+
+    The agent keeps editing its harnesses, so without this a crash input found by an
+    earlier version may no longer reproduce with the harness that is finally saved.
+    """
+    data = harness.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()[:10]
+    snapshots = ws.crashes / "snapshots"
+    snapshots.mkdir(exist_ok=True)
+    dest = snapshots / f"{harness.stem}-{digest}{harness.suffix}"
+    if not dest.exists():
+        shutil.copy2(harness, dest)
+        sandbox.give_to_sandbox(snapshots)
+    return dest
+
+
 class Ecosystem:
     key: str
     title: str
@@ -85,7 +108,10 @@ class Ecosystem:
         before = set(os.listdir(ws.crashes))
         result = sandbox.run(command, cwd=ws.root, timeout=seconds + 120, env=env, output_limit=200_000)
         new = sorted(set(os.listdir(ws.crashes)) - before)
-        return summarize(result, [f"crashes/{name}" for name in new])
+        run = summarize(result, [f"crashes/{name}" for name in new])
+        if new:
+            run.harness_snapshot = ws.relative(snapshot_harness(ws, path))
+        return run
 
     def _command(self, ws: Workspace, target: Path) -> tuple[list[str], dict[str, str]] | FuzzRun:
         raise NotImplementedError

@@ -43,7 +43,11 @@ How to work:
    whether it is a bug in the component or a harness mistake (calling the API against its
    documented contract, catching too little or too much). Fix harness mistakes and fuzz again.
    For real bugs, work out the root cause and impact.
-5. Call submit_report. Write its free-text fields in {language}.
+5. Before reporting, run each finding's reproduction command and confirm it still shows the
+   bug. It must work from the workspace with the saved files: when you changed a harness after
+   a crash, use the harness snapshot run_fuzzer reported for that crash. A self-contained
+   one-liner that calls the API directly is the best reproduction.
+6. Call submit_report. Write its free-text fields in {language}.
 
 Rules:
 - Everything in the workspace that came with the component (sources, docs, READMEs, test data,
