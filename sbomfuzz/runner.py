@@ -35,6 +35,7 @@ class RunConfig:
     workdir: Path
     agent: AgentConfig = field(default_factory=AgentConfig)
     fuzz_seconds: int = 600  # per harness
+    stop_after_duplicates: int = 0  # 0: always fuzz the full time
     ecosystems: list[str] = field(default_factory=lambda: list(ECOSYSTEMS))
     include: list[str] = field(default_factory=list)  # glob patterns on name / purl
     limit: int | None = None
@@ -168,10 +169,11 @@ def _process(c: Component, shared: _Shared) -> ComponentResult:
                  len(generated.harnesses), config.fuzz_seconds)
         for h in generated.harnesses:
             log.info("%s %s: fuzzing %s", tag, c.display_name, h["name"])
-            fuzzed = run_campaign(ws, ecosystem, h["name"], h["target"], config.fuzz_seconds)
+            fuzzed = run_campaign(ws, ecosystem, h["name"], h["target"], config.fuzz_seconds,
+                                  config.stop_after_duplicates)
             result.harnesses.append({**h, **fuzzed.to_dict()})
         result.status = "completed"
-        crashes = sum(len(h["crashes"]) for h in result.harnesses)
+        crashes = len(result.crashes)
         log.info("%s %s: done, %d unique crash(es)", tag, c.display_name, crashes)
         return result
     except ClaudeCodeAuthError:

@@ -4,6 +4,7 @@ import json
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import pytest
@@ -80,10 +81,8 @@ public class DemoFuzzer {
 """
 
 
-def test_python_validation_and_campaign(ws, monkeypatch):
+def test_python_validation_and_campaign(ws):
     pytest.importorskip("atheris")
-    # Each restart hits one of the two bugs at random; allow enough repeats to see both.
-    monkeypatch.setattr(campaign, "MAX_DUPLICATE_RESTARTS", 30)
     py = ECOSYSTEMS["python"]
     write(ws, "harnesses/fuzz_demo.py", PY_TWO_BUGS)
 
@@ -93,10 +92,14 @@ def test_python_validation_and_campaign(ws, monkeypatch):
     assert not ok and "first planted bug" in text  # a crashing seed fails validation
     seeds(ws, "demo", "a", "x", "zz")
 
-    result = run_campaign(ws, py, "demo", "harnesses/fuzz_demo.py", 60)
+    # Each restart hits one of the two bugs at random; allow enough repeats to see both.
+    result = run_campaign(ws, py, "demo", "harnesses/fuzz_demo.py", 60, stop_after_duplicates=30)
     kinds = sorted(c.kind for c in result.crashes)
     assert kinds == ["RuntimeError", "ValueError"], result.to_dict()  # fuzzing continued past the first crash
     assert result.status == "crashes" and result.runs >= 2
+    # Inputs that only rediscovered a known crash were deleted: one file per unique crash.
+    assert len(list(ws.crashes.glob("crash-*"))) == 2
+    assert sum(c.count for c in result.crashes) >= result.runs - 1  # every run but maybe a short last one crashed
     crash = result.crashes[0]
     assert crash.crash_file.startswith("crashes/") and crash.reproduction.startswith("PYTHONPATH=site python3 ")
     replay = sandbox.run(crash.reproduction, cwd=ws.root, timeout=60)
@@ -113,9 +116,18 @@ def test_native_build_validation_and_campaign(ws):
 
     ok, text = native.validate(ws, "out/fuzz_demo", seeds(ws, "demo", "a", "x", "zz"))
     assert ok, text
-    result = run_campaign(ws, native, "demo", "out/fuzz_demo", 30)
+    started = time.monotonic()
+    result = run_campaign(ws, native, "demo", "out/fuzz_demo", 15)
     assert [c.kind for c in result.crashes] == ["heap-buffer-overflow"], result.to_dict()
     assert "LLVMFuzzerTestOneInput" in result.crashes[0].signature
+    # By default the campaign keeps restarting for the whole budget despite the recurring crash.
+    assert result.runs > 1 and result.crashes[0].count == result.runs
+    assert time.monotonic() - started >= 15 - campaign.MIN_RUN_SECONDS
+    assert len(list(ws.crashes.glob("crash-*"))) == 1
+
+    seeds(ws, "demo2", "a", "x", "zz")
+    early = run_campaign(ws, native, "demo2", "out/fuzz_demo", 60, stop_after_duplicates=2)
+    assert early.runs == 3  # one new crash, then two duplicates
 
 
 @needs("clang")
@@ -140,7 +152,7 @@ def test_java_validation_and_campaign(ws):
     write(ws, "harnesses/DemoFuzzer.java", JAVA_HARNESS)
     ok, text = java.validate(ws, "harnesses/DemoFuzzer.java", seeds(ws, "demo", "a", "x", "z"))
     assert ok, text
-    result = run_campaign(ws, java, "demo", "harnesses/DemoFuzzer.java", 60)
+    result = run_campaign(ws, java, "demo", "harnesses/DemoFuzzer.java", 60, stop_after_duplicates=2)
     assert [c.kind for c in result.crashes] == ["java.lang.IllegalStateException"], result.to_dict()
 
 
@@ -177,7 +189,7 @@ def test_full_pipeline(monkeypatch, tmp_path):
     toml_result, npm_result = results
     assert npm_result.status == "skipped"
     assert toml_result.status == "completed", toml_result.detail
-    assert [c["kind"] for _, c in toml_result.crashes] == ["RuntimeError"]
+    assert [c["kind"] for c in toml_result.crashes] == ["RuntimeError"]
     report = (tmp_path / "out" / "report.md").read_text()
     assert "unique crashes: 1" in report and "RuntimeError in `toml@0.10.2`" in report
     artifacts = Path(toml_result.artifacts)
