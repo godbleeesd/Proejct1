@@ -92,6 +92,33 @@ docker run --rm -e CLAUDE_CODE_OAUTH_TOKEN -v "$PWD:/data" sbomfuzz run examples
 Её нужно выполнять в рабочей папке компонента, поэтому запускайте с `--keep-workdirs` и `--workdir`,
 смонтированным на диск, например `--workdir /data/work`.
 
+## Статический анализ: сборка под Svace
+
+Команда `sbomfuzz svace` — этап статического анализа. Для каждого компонента она скачивает исходники
+и выполняет контролируемую сборку под Svace (`svace build`). Результат каждого компонента — архив
+`svace-dir.tar.gz` с проектом Svace (`<проект>/.svace-dir`), он подаётся на `svace analyze`.
+
+| Экосистема | Что собирается |
+|---|---|
+| C/C++ | исходники, система сборки определяется автоматически: CMake, Meson, autotools или Makefile. Шаг configure идёт вне Svace, чтобы его пробные компиляции не попали в анализ |
+| Java | sources jar артефакта, компиляция `javac` с зависимостями из POM |
+| Python | собственные модули пакета, без зависимостей (`svace build --python`) |
+
+Svace не входит в образ: он лицензируется ИСП РАН. Смонтируйте дистрибутив (x64 Linux) в `/opt/svace`:
+
+```bash
+docker run --rm -v "$PWD:/data" -v /path/to/svace:/opt/svace sbomfuzz svace examples/test-bom.json --out svace-results
+```
+
+Результаты лежат в `svace-results/`: `report.md`, `report.json`, а по каждому компоненту `components/<компонент>/svace-dir.tar.gz`
+и полный журнал сборки `build.log`. Чтобы проанализировать архив:
+`tar -xzf svace-dir.tar.gz && svace analyze --svace-dir <проект>`.
+
+Основные параметры: `--svace-option` (дополнительная опция `svace build`, можно повторять), `--build-cmd` и `--configure-cmd`
+(свои команды сборки C/C++ вместо определённых автоматически), `--build-jobs`, `--timeout`.
+Команда завершается с кодом 4, если хотя бы один выбранный компонент не собрался или не собрано ничего: так её удобно
+использовать как проверку в CI.
+
 ## Безопасность
 
 При фаззинге выполняется сторонний код: скрипты установки пакетов, системы сборки, сами компоненты.
@@ -109,7 +136,9 @@ docker run --rm -e CLAUDE_CODE_OAUTH_TOKEN -v "$PWD:/data" sbomfuzz run examples
 
 ```
 sbomfuzz/
-  cli.py         команды list и run
+  cli.py         команды list, run и svace
+  svace.py       контролируемая сборка под Svace и архивация .svace-dir
+  svace_report.py отчёт этапа Svace
   sbom.py        разбор CycloneDX JSON и purl
   fetch.py       загрузка компонентов (pip, Maven, архивы, git)
   claude_code.py запуск Claude Code (claude -p), который пишет обёртки

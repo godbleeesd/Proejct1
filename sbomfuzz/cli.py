@@ -1,4 +1,4 @@
-"""Command line: `sbomfuzz list`, `sbomfuzz run` (and the internal `sbomfuzz mcp-server`)."""
+"""Command line: `sbomfuzz list`, `sbomfuzz run`, `sbomfuzz svace` (and the internal `sbomfuzz mcp-server`)."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from .prompts import AgentConfig
 from .sbom import SbomError, load_cyclonedx
 
 EXIT_CRASHES = 3
+EXIT_BUILD_FAILED = 4
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -60,6 +61,35 @@ def main(argv: list[str] | None = None) -> int:
     p_run.add_argument("--keep-workdirs", action="store_true",
                        help="keep downloads and builds, e.g. to replay crashes")
 
+    p_svace = sub.add_parser("svace", help="build the SBOM's components under Svace and archive each .svace-dir",
+                             description="Static-analysis stage. For each component: download it, run its build "
+                                         "under `svace build` (a controlled build) and pack the Svace project "
+                                         "directory into <out>/components/<component>/svace-dir.tar.gz.")
+    p_svace.add_argument("sbom", type=Path)
+    p_svace.add_argument("-o", "--out", type=Path, default=Path("svace-results"),
+                         help="directory for report.md, report.json, the archives and build logs")
+    p_svace.add_argument("--workdir", type=Path, default=Path(tempfile.gettempdir()) / "sbomfuzz-svace-work",
+                         help="scratch directory for downloads and builds")
+    p_svace.add_argument("-e", "--ecosystem", action="append", choices=sorted(ECOSYSTEMS),
+                         help="only build these ecosystems (repeatable; default: all)")
+    p_svace.add_argument("-c", "--component", action="append", default=[], metavar="PATTERN",
+                         help="only build components whose name or purl matches this glob (repeatable)")
+    p_svace.add_argument("--limit", type=int, help="build at most this many components")
+    p_svace.add_argument("--svace", default=None,
+                         help="the svace executable (default: $SVACE_BIN, else svace on PATH)")
+    p_svace.add_argument("--svace-option", action="append", default=[], metavar="OPTION",
+                         help="extra option for `svace build`, e.g. --svace-option=--enable-ptrace (repeatable)")
+    p_svace.add_argument("--configure-cmd",
+                         help="C/C++: shell command run in the source root before the build, outside Svace "
+                              "(replaces the detected configure step)")
+    p_svace.add_argument("--build-cmd",
+                         help="C/C++: shell command run under `svace build` in the source root "
+                              "(replaces the detected build system)")
+    p_svace.add_argument("--build-jobs", type=int, default=os.cpu_count() or 1,
+                         help="parallel jobs for make / ninja (default: CPU count)")
+    p_svace.add_argument("--timeout", type=int, default=3600, help="time limit per build command (default 3600s)")
+    p_svace.add_argument("--keep-workdirs", action="store_true", help="keep downloads and builds")
+
     # Started by Claude Code; not meant to be run by hand.
     p_mcp = sub.add_parser("mcp-server")
     p_mcp.add_argument("config", type=Path)
@@ -76,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "list":
             return _list(args)
+        if args.command == "svace":
+            return _svace(args)
         return _run(args)
     except SbomError as e:
         print(f"error: {e}", file=sys.stderr)
@@ -94,6 +126,46 @@ def _list(args) -> int:
         print(f"{c.display_name:<50} {c.ecosystem or '-':<8} {status}")
     fuzzable = sum(c.skip_reason() is None for c in components)
     print(f"\n{len(components)} components, {fuzzable} fuzzable")
+    return 0
+
+
+def _svace(args) -> int:
+    import shutil
+
+    from .sandbox import sandbox_active
+    from .svace import SVACE_BIN, BuildConfig, run
+
+    svace_bin = args.svace or SVACE_BIN
+    if shutil.which(svace_bin) is None:
+        print(f"error: Svace not found ({svace_bin}). Put the bin/ directory of the Svace distribution on PATH, "
+              "set SVACE_BIN or pass --svace; with Docker, mount the distribution at /opt/svace.", file=sys.stderr)
+        return 1
+    if not sandbox_active():
+        logging.warning("not running as root with a 'fuzzer' user: builds run as the current user. "
+                        "Use the Docker image for isolation.")
+    results, _ = run(BuildConfig(
+        sbom=args.sbom,
+        out=args.out,
+        workdir=args.workdir,
+        svace=svace_bin,
+        svace_options=args.svace_option,
+        ecosystems=args.ecosystem or list(ECOSYSTEMS),
+        include=args.component,
+        limit=args.limit,
+        configure_cmd=args.configure_cmd,
+        build_cmd=args.build_cmd,
+        build_jobs=args.build_jobs,
+        timeout=args.timeout,
+        keep_workdirs=args.keep_workdirs,
+    ))
+
+    archives = [r.archive for r in results if r.archive]
+    print(f"\nReport: {args.out / 'report.md'}")
+    for archive in archives:
+        print(f"Archive: {args.out / archive}")
+    # CI gate: every selected component must yield an archive, and at least one must.
+    if not archives or any(r.status not in ("built", "skipped") for r in results):
+        return EXIT_BUILD_FAILED
     return 0
 
 

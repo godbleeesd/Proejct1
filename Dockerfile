@@ -41,6 +41,11 @@ RUN curl -fsSL https://claude.ai/install.sh | bash -s "${CLAUDE_CODE_VERSION}" \
 RUN python3 -m venv /opt/venv \
     && pip install --no-cache-dir "atheris==${ATHERIS_VERSION}"
 
+# Svace (`sbomfuzz svace`) is not part of the image: it is licensed by ISP RAS. Mount the
+# x64 Linux distribution at /opt/svace (-v /path/to/svace:/opt/svace); it must be readable by
+# the sandbox user, which runs the builds.
+ENV PATH=$PATH:/opt/svace/bin
+
 # Untrusted code (package installs, builds, harnesses) runs as this user.
 RUN useradd --create-home --uid 10001 fuzzer
 
