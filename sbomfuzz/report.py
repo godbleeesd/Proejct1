@@ -12,7 +12,7 @@ from .usage import Usage
 @dataclass
 class ComponentResult:
     component: dict
-    # completed | no_harness | incomplete | skipped | fetch_failed | usage_limit | error
+    # completed | not_fuzzed | missing | no_harness | incomplete | skipped | fetch_failed | usage_limit | error
     status: str
     detail: str = ""
     harnesses: list[dict] = field(default_factory=list)  # accepted harness + its fuzzing result
@@ -21,7 +21,7 @@ class ComponentResult:
     usage: Usage = field(default_factory=Usage)
     turns: int = 0
     duration_seconds: float = 0.0
-    artifacts: str | None = None
+    artifacts: str | None = None  # the component's bundle directory
 
     @property
     def crashes(self) -> list[dict]:
@@ -33,7 +33,8 @@ class ComponentResult:
                 entry = merged.get(c["signature"])
                 if entry is None:
                     merged[c["signature"]] = {**c, "harness": h["name"], "source": h["source"],
-                                              "target_api": h.get("target_api", ""), "found_by": [h["name"]]}
+                                              "target_api": h.get("target_api", ""), "found_by": [h["name"]],
+                                              "artifacts": h.get("artifacts", "")}
                 else:
                     entry["count"] += c["count"]
                     if h["name"] not in entry["found_by"]:
@@ -101,7 +102,7 @@ def render_markdown(meta: dict, results: list[ComponentResult], total: Usage) ->
                 f"- Found by: {found_by}; input and command below are from `{c['harness']}` "
                 f"(`{c['source']}`, API: {c['target_api'] or '-'})",
                 f"- Input: `{c['crash_file'] or '-'}` (hit {c['count']} time(s))",
-                f"- Artifacts: `{r.artifacts or '-'}`",
+                f"- Artifacts: `{c.get('artifacts') or r.artifacts or '-'}`",
                 f"- Reproduce in the workspace (`--keep-workdirs`): `{c['reproduction'] or '-'}`",
                 "",
                 "```",

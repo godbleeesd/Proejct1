@@ -180,14 +180,15 @@ def test_full_pipeline(monkeypatch, tmp_path):
         {"type": "library", "name": "left-pad", "version": "1.3.0", "purl": "pkg:npm/left-pad@1.3.0"}]}))
     work = Path(tempfile.mkdtemp(prefix="sbomfuzz-work-"))
     work.chmod(0o755)
+    out = tmp_path / "out"
     # Leftovers from an earlier run with the same --out must not end up in this report.
     from sbomfuzz.sbom import load_cyclonedx
-    stale = tmp_path / "out" / "components" / load_cyclonedx(sbom)[0].slug / "crashes" / "crash-stale"
+    slug = load_cyclonedx(sbom)[0].slug
+    stale = out / "fuzz" / slug / "demo" / "crashes" / "crash-stale"
     stale.parent.mkdir(parents=True)
     stale.write_text("old")
     try:
-        results, _ = run(RunConfig(sbom=sbom, out=tmp_path / "out", workdir=work, agent=AgentConfig(),
-                                   fuzz_seconds=20))
+        results, _ = run(RunConfig(sbom=sbom, out=out, workdir=work, agent=AgentConfig(), fuzz_seconds=20))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -195,13 +196,65 @@ def test_full_pipeline(monkeypatch, tmp_path):
     assert npm_result.status == "skipped"
     assert toml_result.status == "completed", toml_result.detail
     assert [c["kind"] for c in toml_result.crashes] == ["RuntimeError"]
-    report = (tmp_path / "out" / "report.md").read_text()
+    report = (out / "report.md").read_text()
     assert "unique crashes: 1" in report and "RuntimeError in `toml@0.10.2`" in report
-    artifacts = Path(toml_result.artifacts)
-    assert (artifacts / "harnesses" / "fuzz_demo.py").exists()
+
+    # The bundle holds what the fuzz stage needs to rebuild the harness elsewhere.
+    bundle = out / "bundles" / slug
+    assert (bundle / "workspace" / "harnesses" / "fuzz_demo.py").exists()
+    assert sorted(p.name for p in (bundle / "workspace" / "corpus" / "demo").iterdir()) == \
+        ["seed-1", "seed-2", "seed-3"]
+    assert json.loads((bundle / "bundle.json").read_text())["status"] == "ready"
+    assert (out / "plan.json").exists()
+    fuzzed = out / "fuzz" / slug / "demo"
     assert not stale.exists()
-    assert len(list((artifacts / "crashes").glob("crash-*"))) == 1  # duplicates of the one crash were dropped
-    assert sorted(p.name for p in (artifacts / "seeds" / "demo").iterdir()) == ["seed-1", "seed-2", "seed-3"]
+    assert len(list((fuzzed / "crashes").glob("crash-*"))) == 1  # duplicates of the one crash were dropped
+    assert toml_result.crashes[0]["artifacts"] == f"fuzz/{slug}/demo"
+
+
+def test_pipeline_as_separate_ci_stages(monkeypatch, tmp_path):
+    """plan -> generate -> fuzz -> report as separate commands, the way CI jobs run them: the fuzz
+    stage gets only the bundle and rebuilds everything in a fresh workspace."""
+    pytest.importorskip("atheris")
+    from sbomfuzz import cli
+
+    monkeypatch.setattr(claude_code, "CLAUDE_CMD", [sys.executable, str(Path(__file__).parent / "fake_claude.py")])
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(tmp_path / "fake.log"))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
+    monkeypatch.chdir(tmp_path)
+    Path("bom.json").write_text(json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [
+        {"type": "library", "name": "toml", "version": "0.10.2", "purl": "pkg:pypi/toml@0.10.2"},
+        {"type": "library", "name": "xmltodict", "version": "0.12.0", "purl": "pkg:pypi/xmltodict@0.12.0"},
+        {"type": "library", "name": "left-pad", "version": "1.3.0", "purl": "pkg:npm/left-pad@1.3.0"}]}))
+    work = Path(tempfile.mkdtemp(prefix="sbomfuzz-work-"))
+    work.chmod(0o755)
+    try:
+        assert cli.main(["plan", "bom.json", "-o", "plan.json"]) == 0
+        plan = json.loads(Path("plan.json").read_text())
+        assert [e["component"]["name"] for e in plan["components"]] == ["toml", "xmltodict"]
+        assert plan["skipped"][0]["reason"] == "unsupported ecosystem (npm)"
+        toml_slug = plan["components"][0]["slug"]
+
+        # One generate job for toml only; xmltodict's job never ran.
+        assert cli.main(["generate", "plan.json", "--slug", toml_slug, "-o", "bundles", "--workdir", str(work)]) == 0
+        assert cli.main(["generate", "plan.json", "--slug", "no-such-slug", "--workdir", str(work)]) == 1
+        assert not any(work.iterdir())  # generate cleaned up its workspace
+
+        assert cli.main(["fuzz", f"bundles/{toml_slug}", "--harness", "demo", "-o", "fuzz-results",
+                         "--workdir", str(work), "--fuzz-seconds", "10", "--stop-after-duplicates", "2"]) == 0
+        result = json.loads(Path(f"fuzz-results/{toml_slug}/demo/result.json").read_text())
+        assert result["result"]["status"] == "crashes", result
+
+        assert cli.main(["report", "plan.json", "--bundles", "bundles", "--fuzz", "fuzz-results",
+                         "-o", "fuzz-report", "--fail-on-crash"]) == cli.EXIT_CRASHES
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    data = json.loads(Path("fuzz-report/report.json").read_text())
+    statuses = {c["component"]["name"]: c["status"] for c in data["components"]}
+    assert statuses == {"toml": "completed", "xmltodict": "missing", "left-pad": "skipped"}
+    report = Path("fuzz-report/report.md").read_text()
+    assert "RuntimeError in `toml@0.10.2`" in report
+    assert f"`../fuzz-results/{toml_slug}/demo`" in report
 
 
 def component(**kw):

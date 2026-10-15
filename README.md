@@ -58,11 +58,35 @@ docker run -it --rm --entrypoint claude sbomfuzz setup-token
 docker run --rm -e CLAUDE_CODE_OAUTH_TOKEN -v "$PWD:/data" sbomfuzz run examples/sample-bom.json --out results
 ```
 
-Отчёт появится в `results/report.md`. По каждому компоненту в `results/components/<компонент>/` сохраняются
-обёртки, стартовые входы (`seeds/`), входные данные падений (`crashes/`) и журнал работы Claude.
+Отчёт появится в `results/report.md`. В `results/` также лежат:
+- `plan.json` — какие компоненты обработаны и какие пропущены;
+- `bundles/<компонент>/` — комплект от Claude: `bundle.json`, обёртки, скрипт сборки и стартовые входы
+  (в `workspace/`), журнал работы Claude;
+- `fuzz/<компонент>/<обёртка>/` — результат фаззинга: `result.json` и входные данные падений (`crashes/`).
 
 Лимиты подписки тратятся только на этап с обёртками, фаззинг их не расходует. Если лимит закончится,
 оставшиеся компоненты получат статус `usage_limit`, а отчёт по уже проверенным сохранится.
+
+## Этапы для CI/CD
+
+`run` выполняет все этапы фаззинга подряд на одной машине. В CI/CD каждый этап запускается отдельной
+задачей, а результаты передаются между задачами как артефакты:
+
+| Этап | Команда | Вход | Выход |
+|---|---|---|---|
+| 1. План | `sbomfuzz plan bom.json -o plan.json` | SBOM | `plan.json`: компоненты (по одной задаче на каждый) и пропущенные |
+| 2. Обёртки | `sbomfuzz generate plan.json --slug <компонент> -o bundles` | план | `bundles/<компонент>/`: проверенные обёртки и входы |
+| 3. Фаззинг | `sbomfuzz fuzz bundles/<компонент> [--harness <имя>] -o fuzz-results` | комплект | `fuzz-results/<компонент>/<обёртка>/` |
+| 4. Отчёт | `sbomfuzz report plan.json --bundles bundles --fuzz fuzz-results -o fuzz-report` | всё выше | `report.md`, `report.json` |
+| Статика | `sbomfuzz svace bom.json -o svace-results` | SBOM | архивы `svace-dir.tar.gz` и журналы сборки |
+
+Этап фаззинга не зависит от машины, на которой писались обёртки: он заново скачивает компонент, восстанавливает
+из комплекта обёртки и входы и собирает их. Поэтому обёртки одного компонента можно фаззить параллельно,
+каждую в своей задаче (`--harness`). Если какого-то этапа не было, отчёт показывает это статусом компонента:
+`missing` (нет комплекта) или `not_fuzzed` (нет результатов фаззинга).
+
+Коды выхода: `generate` — 5, если лимит подписки закончился (задачу стоит повторить позже); `report` и `run`
+с `--fail-on-crash` — 3, если найдено падение; `svace` — 4, если компонент не собрался.
 
 ## Основные параметры `run`
 
@@ -136,7 +160,7 @@ docker run --rm -v "$PWD:/data" -v /path/to/svace:/opt/svace sbomfuzz svace exam
 
 ```
 sbomfuzz/
-  cli.py         команды list, run и svace
+  cli.py         команды: plan, generate, fuzz, report, run, svace, list
   svace.py       контролируемая сборка под Svace и архивация .svace-dir
   svace_report.py отчёт этапа Svace
   sbom.py        разбор CycloneDX JSON и purl
@@ -149,7 +173,8 @@ sbomfuzz/
   campaign.py    фаззинг одной обёртки: перезапуски, склейка повторов
   crashes.py     тип и сигнатура падения по выводу фаззера
   sandbox.py     запуск команд от непривилегированного пользователя
-  runner.py      конвейер по всем компонентам, сохранение артефактов
+  stages.py      этапы конвейера: plan, generate, fuzz, report
+  runner.py      команда run: все этапы фаззинга подряд
   report.py      report.json и report.md
 tests/           unit-тесты и интеграционные тесты с настоящими фаззерами
 ```
