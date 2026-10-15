@@ -58,6 +58,7 @@ class ToolBox:
         self.attempts = 0
         self.accepted: list[AcceptedHarness] | None = None  # set when generation is over
         self.validation_log: list[dict] = []
+        self.written: set[str] = set()  # workspace-relative paths of files the model wrote
         self._lock = threading.Lock()
 
     @property
@@ -78,6 +79,8 @@ class ToolBox:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         sandbox.give_to_sandbox(first_new or target)
+        with self._lock:
+            self.written.add(self.ws.relative(target))
         return f"wrote {len(content)} characters to {self.ws.relative(target)}", False
 
     def submit_harnesses(self, harnesses: list[dict]) -> tuple[str, bool]:

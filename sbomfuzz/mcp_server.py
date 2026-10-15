@@ -63,6 +63,7 @@ class SessionState:
             "attempts": tb.attempts,
             "accepted": [h.to_dict() for h in tb.accepted] if tb.accepted is not None else None,
             "validation": tb.validation_log,
+            "written": sorted(tb.written),
         }
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")

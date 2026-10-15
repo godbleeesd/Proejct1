@@ -45,6 +45,7 @@ class GenerationOutcome:
     harnesses: list[dict] = field(default_factory=list)
     attempts: int = 0
     validation: list[dict] = field(default_factory=list)
+    written: list[str] = field(default_factory=list)  # files the model wrote, relative to the workspace
     usage: Usage = field(default_factory=Usage)
     turns: int = 0
 
@@ -169,6 +170,7 @@ class HarnessGenerator:
             return
         outcome.attempts = state.get("attempts") or 0
         outcome.validation = state.get("validation") or []
+        outcome.written = state.get("written") or []
         if state.get("accepted") is not None:
             outcome.status, outcome.detail = "done", ""
             outcome.harnesses = state["accepted"]
