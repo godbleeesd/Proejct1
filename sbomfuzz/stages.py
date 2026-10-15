@@ -176,8 +176,11 @@ def _is_build_output(path: Path) -> bool:
 # --- fuzz --------------------------------------------------------------------------------
 
 def fuzz(bundle_dir: Path, out_root: Path, workdir: Path, seconds: int, stop_after_duplicates: int = 0,
-         harnesses: list[str] | None = None, keep_workdir: bool = False) -> list[dict]:
-    """Fuzz a ready bundle's harnesses (all, or the named ones); writes <out_root>/<slug>/<harness>/."""
+         harnesses: list[str] | None = None, keep_workdir: bool = False,
+         harness_index: int | None = None) -> list[dict]:
+    """Fuzz a ready bundle's harnesses (all, the named ones, or the harness_index-th, counting from 1);
+    writes <out_root>/<slug>/<harness>/. A harness_index past the last harness fuzzes nothing: CI runs
+    a fixed number of parallel jobs per component, and components get different numbers of harnesses."""
     bundle_dir, out_root, workdir = bundle_dir.resolve(), out_root.resolve(), workdir.resolve()
     bundle = read_json(bundle_dir / BUNDLE_FILE)
     if bundle["status"] != "ready":
@@ -188,6 +191,11 @@ def fuzz(bundle_dir: Path, out_root: Path, workdir: Path, seconds: int, stop_aft
     unknown = set(harnesses or []) - {h["name"] for h in bundle["harnesses"]}
     if unknown:
         raise ValueError(f"{c.display_name} has no harness named {', '.join(sorted(unknown))}")
+    if harness_index is not None:
+        if not 1 <= harness_index <= len(chosen):
+            log.info("%s: no harness #%d (it has %d), nothing to fuzz", c.display_name, harness_index, len(chosen))
+            return []
+        chosen = [chosen[harness_index - 1]]
     ecosystem = ECOSYSTEMS[c.ecosystem]
 
     ws = Workspace.create(workdir / f"{c.slug}-fuzz")

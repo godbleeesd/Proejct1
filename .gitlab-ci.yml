@@ -1,0 +1,99 @@
+# SBOM -> two results: static analysis (Svace) and fuzzing.
+#
+#   image     builds the sbomfuzz image into the project's registry (when the code changes, or BUILD_IMAGE=true)
+#   plan      parses the SBOM: plan.json + the child pipeline for the fuzzing jobs
+#   svace     controlled build of every component under Svace -> svace-results/ (result 1)
+#   fuzzing   child pipeline: Claude writes harnesses per component, each harness is fuzzed in its
+#             own job, then a report -> fuzz-report/, bundles/, fuzz-results/ (result 2)
+#
+# Run it with another SBOM: commit the file and set SBOM, or pass a File-type variable named SBOM
+# when running the pipeline (CI/CD > Run pipeline).
+#
+# Project settings (Settings > CI/CD > Variables):
+#   CLAUDE_CODE_OAUTH_TOKEN  masked, protected: the Claude subscription token from `claude setup-token`
+# Runners:
+#   svace job: a runner tagged "svace" with the licensed Svace distribution mounted at /opt/svace
+#              (in config.toml: volumes = ["/path/to/svace:/opt/svace:ro"])
+#   image job: a runner that allows Docker-in-Docker (privileged)
+
+variables:
+  SBOM: examples/test-bom.json
+  SBOMFUZZ_IMAGE: $CI_REGISTRY_IMAGE/sbomfuzz:latest
+  FUZZ_SECONDS: "600"          # fuzzing time per harness
+  MAX_HARNESSES: "3"           # harnesses per component = parallel fuzz jobs per component
+  SVACE_ENABLED: "true"
+  BUILD_IMAGE: "false"
+  PLAN_ARGS: ""                # e.g. "-e native --limit 10"
+  GENERATE_ARGS: ""            # e.g. "--language Russian --effort xhigh"
+  FUZZ_ARGS: ""                # e.g. "--stop-after-duplicates 20"
+  REPORT_ARGS: ""              # e.g. "--fail-on-crash"
+  SVACE_ARGS: ""               # e.g. "--svace-option=--enable-ptrace"
+
+stages:
+  - image
+  - plan
+  - analyze
+
+.sbomfuzz:
+  image:
+    name: $SBOMFUZZ_IMAGE
+    entrypoint: [""]
+
+image:
+  stage: image
+  image: docker:27.3.1
+  services:
+    - docker:27.3.1-dind
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$SBOMFUZZ_IMAGE" .
+    - docker push "$SBOMFUZZ_IMAGE"
+  rules:
+    - if: $BUILD_IMAGE == "true"
+    - changes: [Dockerfile, pyproject.toml, "sbomfuzz/**/*"]
+
+plan:
+  extends: .sbomfuzz
+  stage: plan
+  needs:
+    - job: image
+      optional: true
+  script:
+    - sbomfuzz plan "$SBOM" -o plan.json --gitlab-ci child-pipeline.yml
+      --max-harnesses "$MAX_HARNESSES" --fuzz-seconds "$FUZZ_SECONDS" $PLAN_ARGS
+  artifacts:
+    paths: [plan.json, child-pipeline.yml]
+    expire_in: 30 days
+
+svace:
+  extends: .sbomfuzz
+  stage: analyze
+  needs:
+    - job: image
+      optional: true
+  tags: [svace]
+  script:
+    - sbomfuzz svace "$SBOM" -o svace-results $PLAN_ARGS $SVACE_ARGS
+  artifacts:
+    name: static-analysis-results
+    when: always
+    paths: [svace-results/]
+    expire_in: 30 days
+  rules:
+    - if: $SVACE_ENABLED == "true"
+
+fuzzing:
+  stage: analyze
+  needs: [plan]
+  trigger:
+    include:
+      - artifact: child-pipeline.yml
+        job: plan
+    strategy: depend
+  variables:
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+    SBOMFUZZ_IMAGE: $SBOMFUZZ_IMAGE
+    FUZZ_SECONDS: $FUZZ_SECONDS
+    GENERATE_ARGS: $GENERATE_ARGS
+    FUZZ_ARGS: $FUZZ_ARGS
+    REPORT_ARGS: $REPORT_ARGS
