@@ -69,6 +69,14 @@ def main(argv: list[str] | None = None) -> int:
     p_plan.add_argument("sbom", type=Path)
     p_plan.add_argument("-o", "--out", type=Path, default=Path("plan.json"), help="plan file (default plan.json)")
     _selection_args(p_plan, "plan")
+    p_plan.add_argument("--gitlab-ci", type=Path, metavar="FILE",
+                        help="also write a GitLab CI child pipeline with the generate, fuzz and report jobs")
+    p_plan.add_argument("--max-harnesses", type=int, default=3,
+                        help="with --gitlab-ci: parallel fuzz jobs per component, one per harness (default 3)")
+    p_plan.add_argument("--fuzz-seconds", type=int, default=600,
+                        help="with --gitlab-ci: fuzzing time per harness, for the fuzz jobs' timeout (default 600)")
+    p_plan.add_argument("--runner-tag", action="append", default=[],
+                        help="with --gitlab-ci: runner tag for the child pipeline's jobs (repeatable)")
 
     p_gen = sub.add_parser("generate", help="stage 2: Claude writes validated harnesses -> one bundle per component")
     p_gen.add_argument("plan", type=Path, help="plan.json from `sbomfuzz plan`")
@@ -84,6 +92,9 @@ def main(argv: list[str] | None = None) -> int:
     p_fuzz.add_argument("bundles", type=Path, nargs="+", help="bundle directories (bundles/<slug>)")
     p_fuzz.add_argument("--harness", action="append", default=[],
                         help="only this harness of the bundle (repeatable; default: all)")
+    p_fuzz.add_argument("--harness-index", type=int, metavar="N",
+                        help="only the N-th harness, counting from 1; past the last one there is nothing to do "
+                             "(for parallel CI jobs: --harness-index $CI_NODE_INDEX)")
     p_fuzz.add_argument("-o", "--out", type=Path, default=Path("fuzz-results"),
                         help="directory for the results, <slug>/<harness>/ each (default fuzz-results)")
     p_fuzz.add_argument("--workdir", type=Path, default=TMP / "sbomfuzz-work", help="scratch directory")
@@ -207,6 +218,12 @@ def _plan(args) -> int:
     for entry in plan["components"]:
         print(f"{entry['slug']:<60} {entry['ecosystem']}")
     print(f"\n{len(plan['components'])} to process, {len(plan['skipped'])} skipped -> {args.out}")
+    if args.gitlab_ci:
+        from .gitlab import child_pipeline
+
+        stages.write_json(args.gitlab_ci, child_pipeline(plan, args.max_harnesses, args.fuzz_seconds,
+                                                         args.runner_tag))
+        print(f"GitLab CI child pipeline -> {args.gitlab_ci}")
     return 0
 
 
@@ -245,7 +262,7 @@ def _fuzz(args) -> int:
 
     for bundle in args.bundles:
         stages.fuzz(bundle, args.out, args.workdir, args.fuzz_seconds, args.stop_after_duplicates,
-                    args.harness or None, args.keep_workdirs)
+                    args.harness or None, args.keep_workdirs, args.harness_index)
     print(f"\nFuzz results: {args.out}")
     return 0
 

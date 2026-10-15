@@ -85,6 +85,37 @@ docker run --rm -e CLAUDE_CODE_OAUTH_TOKEN -v "$PWD:/data" sbomfuzz run examples
 каждую в своей задаче (`--harness`). Если какого-то этапа не было, отчёт показывает это статусом компонента:
 `missing` (нет комплекта) или `not_fuzzed` (нет результатов фаззинга).
 
+## GitLab CI
+
+Готовый пайплайн — [.gitlab-ci.yml](.gitlab-ci.yml). Он выдаёт два результата: статику и фаззинг.
+
+```
+image ──► plan ──┬──► svace ─────────────────────────────► svace-results/   (результат 1: статика)
+                 │
+                 └──► fuzzing (дочерний пайплайн)
+                        generate:<компонент>  🤖 Claude пишет обёртки, по задаче на компонент
+                        fuzz:<компонент> 1/3, 2/3, 3/3   по задаче на обёртку, параллельно
+                        report ──────────────────────────► fuzz-report/      (результат 2: фаззинг)
+```
+
+Задача `plan` сама генерирует дочерний пайплайн (`sbomfuzz plan --gitlab-ci child-pipeline.yml`), поэтому число
+задач подстраивается под SBOM.
+
+Что настроить в проекте GitLab:
+1. **Переменная `CLAUDE_CODE_OAUTH_TOKEN`** (Settings → CI/CD → Variables): токен подписки, Masked и Protected.
+   Защищённые переменные доступны только в защищённых ветках, поэтому запускайте пайплайн из них.
+2. **Runner для Svace** с тегом `svace`, у которого дистрибутив Svace смонтирован в `/opt/svace`
+   (в `config.toml` раннера: `volumes = ["/путь/к/svace:/opt/svace:ro"]`). Без Svace поставьте `SVACE_ENABLED: "false"`.
+3. **Runner с Docker-in-Docker** (privileged) для задачи `image`, которая собирает образ в реестр проекта.
+   Она запускается при изменении кода или с `BUILD_IMAGE=true`.
+
+Свой SBOM: положите файл в репозиторий и укажите его в переменной `SBOM`, либо при ручном запуске
+(CI/CD → Run pipeline) передайте переменную `SBOM` типа File.
+
+Основные переменные пайплайна: `FUZZ_SECONDS` (время фаззинга одной обёртки), `MAX_HARNESSES` (обёрток на компонент,
+это же число параллельных задач фаззинга), а также дополнительные аргументы этапов `PLAN_ARGS`, `GENERATE_ARGS`,
+`FUZZ_ARGS`, `REPORT_ARGS` и `SVACE_ARGS`. Например, `REPORT_ARGS: --fail-on-crash` роняет пайплайн при найденном падении.
+
 Коды выхода: `generate` — 5, если лимит подписки закончился (задачу стоит повторить позже); `report` и `run`
 с `--fail-on-crash` — 3, если найдено падение; `svace` — 4, если компонент не собрался.
 
@@ -175,6 +206,7 @@ sbomfuzz/
   sandbox.py     запуск команд от непривилегированного пользователя
   stages.py      этапы конвейера: plan, generate, fuzz, report
   runner.py      команда run: все этапы фаззинга подряд
+  gitlab.py      дочерний пайплайн GitLab CI по плану
   report.py      report.json и report.md
 tests/           unit-тесты и интеграционные тесты с настоящими фаззерами
 ```

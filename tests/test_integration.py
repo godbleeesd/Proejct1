@@ -244,6 +244,10 @@ def test_pipeline_as_separate_ci_stages(monkeypatch, tmp_path):
                          "--workdir", str(work), "--fuzz-seconds", "10", "--stop-after-duplicates", "2"]) == 0
         result = json.loads(Path(f"fuzz-results/{toml_slug}/demo/result.json").read_text())
         assert result["result"]["status"] == "crashes", result
+        # Parallel CI jobs pick their harness by index; a slot past the last harness has nothing to do.
+        assert cli.main(["fuzz", f"bundles/{toml_slug}", "--harness-index", "2", "-o", "fuzz-extra",
+                         "--workdir", str(work)]) == 0
+        assert not Path("fuzz-extra").exists()
 
         assert cli.main(["report", "plan.json", "--bundles", "bundles", "--fuzz", "fuzz-results",
                          "-o", "fuzz-report", "--fail-on-crash"]) == cli.EXIT_CRASHES
