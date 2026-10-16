@@ -1,6 +1,6 @@
 # SBOM -> two results: static analysis (Svace) and fuzzing.
 #
-#   build-image  builds the sbomfuzz image into the project's registry (when the code changes, or BUILD_IMAGE=true)
+#   build-image  builds the sbomfuzz image into the project's registry (pushes that change the code, or BUILD_IMAGE=true)
 #   plan      parses the SBOM: plan.json + the child pipeline for the fuzzing jobs
 #   svace     controlled build of every component under Svace -> svace-results/ (result 1)
 #   fuzzing   child pipeline: Claude writes harnesses per component, each harness is fuzzed in its
@@ -50,7 +50,10 @@ build-image:
     - docker push "$SBOMFUZZ_IMAGE"
   rules:
     - if: $BUILD_IMAGE == "true"
-    - changes: [Dockerfile, pyproject.toml, "sbomfuzz/**/*"]
+    # `changes` only on pushes: GitLab treats it as always true for pipelines run by hand,
+    # by schedule or by trigger, which would rebuild the image on every such run.
+    - if: $CI_PIPELINE_SOURCE == "push"
+      changes: [Dockerfile, pyproject.toml, "sbomfuzz/**/*"]
 
 plan:
   extends: .sbomfuzz
