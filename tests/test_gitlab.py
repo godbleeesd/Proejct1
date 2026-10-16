@@ -65,9 +65,21 @@ def test_parent_pipeline_matches_the_child():
     text = (ROOT / ".gitlab-ci.yml").read_text()
     assert "\nplan:\n" in text and "--gitlab-ci child-pipeline.yml" in text  # the job the children `need`
     assert "artifact: child-pipeline.yml" in text and "job: plan" in text
-    for variable in ("PARENT_PIPELINE_ID", "SBOMFUZZ_IMAGE", "FUZZ_SECONDS", "GENERATE_ARGS", "FUZZ_ARGS",
-                     "REPORT_ARGS"):
-        assert f"    {variable}: $" in text, f"the trigger job must pass {variable} to the child pipeline"
+    assert "    PARENT_PIPELINE_ID: $CI_PIPELINE_ID" in text
+    # The child's variables come from this file and from the manual run, forwarded by the trigger.
+    assert "yaml_variables: true" in text and "pipeline_variables: true" in text
+    for variable in ("SBOMFUZZ_IMAGE", "FUZZ_SECONDS", "GENERATE_ARGS", "FUZZ_ARGS", "REPORT_ARGS"):
+        assert f"\n  {variable}: " in text, f"{variable} needs a default in the top-level variables"
+
+
+def test_no_variable_refers_to_itself():
+    """`NAME: $NAME` reaches jobs as the literal text "$NAME" (found in the first real run:
+    `sbomfuzz: error: unrecognized arguments: $GENERATE_ARGS`)."""
+    import re
+
+    text = (ROOT / ".gitlab-ci.yml").read_text()
+    loops = re.findall(r"^\s+([A-Z_]+):\s*\$\{?\1\}?\s*$", text, re.MULTILINE)
+    assert not loops, loops
     assert "\nsvace:\n" in text and "sbomfuzz svace" in text
 
 
