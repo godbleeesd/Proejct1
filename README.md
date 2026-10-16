@@ -107,7 +107,7 @@ build-image ──► plan ──┬──► svace ─────────�
 2. **Runner для Svace** с тегом `svace`, у которого дистрибутив Svace смонтирован в `/opt/svace`
    (в `config.toml` раннера: `volumes = ["/путь/к/svace:/opt/svace:ro"]`). Без Svace поставьте `SVACE_ENABLED: "false"`.
 3. **Runner с Docker-in-Docker** (privileged) для задачи `build-image`, которая собирает образ в реестр проекта.
-   Она запускается при изменении кода или с `BUILD_IMAGE=true`.
+   Она запускается при `git push`, меняющем код, или при любом запуске с `BUILD_IMAGE=true`.
 
 Свой SBOM: положите файл в репозиторий и укажите его в переменной `SBOM`, либо при ручном запуске
 (CI/CD → Run pipeline) передайте переменную `SBOM` типа File.
