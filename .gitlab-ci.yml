@@ -1,6 +1,6 @@
 # SBOM -> two results: static analysis (Svace) and fuzzing.
 #
-#   image     builds the sbomfuzz image into the project's registry (when the code changes, or BUILD_IMAGE=true)
+#   build-image  builds the sbomfuzz image into the project's registry (when the code changes, or BUILD_IMAGE=true)
 #   plan      parses the SBOM: plan.json + the child pipeline for the fuzzing jobs
 #   svace     controlled build of every component under Svace -> svace-results/ (result 1)
 #   fuzzing   child pipeline: Claude writes harnesses per component, each harness is fuzzed in its
@@ -14,7 +14,7 @@
 # Runners:
 #   svace job: a runner tagged "svace" with the licensed Svace distribution mounted at /opt/svace
 #              (in config.toml: volumes = ["/path/to/svace:/opt/svace:ro"])
-#   image job: a runner that allows Docker-in-Docker (privileged)
+#   build-image job: a runner that allows Docker-in-Docker (privileged)
 
 variables:
   SBOM: examples/test-bom.json
@@ -30,7 +30,7 @@ variables:
   SVACE_ARGS: ""               # e.g. "--svace-option=--enable-ptrace"
 
 stages:
-  - image
+  - build
   - plan
   - analyze
 
@@ -39,8 +39,8 @@ stages:
     name: $SBOMFUZZ_IMAGE
     entrypoint: [""]
 
-image:
-  stage: image
+build-image:
+  stage: build
   image: docker:27.3.1
   services:
     - docker:27.3.1-dind
@@ -56,7 +56,7 @@ plan:
   extends: .sbomfuzz
   stage: plan
   needs:
-    - job: image
+    - job: build-image
       optional: true
   script:
     - sbomfuzz plan "$SBOM" -o plan.json --gitlab-ci child-pipeline.yml
@@ -69,7 +69,7 @@ svace:
   extends: .sbomfuzz
   stage: analyze
   needs:
-    - job: image
+    - job: build-image
       optional: true
   tags: [svace]
   script:
