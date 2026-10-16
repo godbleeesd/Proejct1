@@ -69,3 +69,18 @@ def test_parent_pipeline_matches_the_child():
                      "REPORT_ARGS"):
         assert f"    {variable}: $" in text, f"the trigger job must pass {variable} to the child pipeline"
     assert "\nsvace:\n" in text and "sbomfuzz svace" in text
+
+
+# Top-level keys GitLab reads as settings, not jobs. A job named `image` broke the first real
+# run: GitLab took it for the default image and rejected the file ("image name should be a string").
+GITLAB_TOP_LEVEL_KEYWORDS = {"default", "include", "stages", "variables", "workflow", "image", "services",
+                             "cache", "before_script", "after_script", "pages"}
+
+
+def test_no_job_is_named_like_a_gitlab_keyword():
+    import re
+
+    parent_jobs = set(re.findall(r"^([A-Za-z0-9_.:-]+):", (ROOT / ".gitlab-ci.yml").read_text(), re.MULTILINE))
+    assert parent_jobs & GITLAB_TOP_LEVEL_KEYWORDS <= {"variables", "stages"}, parent_jobs
+    child = child_pipeline(plan_with("image", "cache-1"), max_harnesses=2, fuzz_seconds=60)
+    assert not (set(child) - {"default", "stages"}) & GITLAB_TOP_LEVEL_KEYWORDS  # job names are prefixed
