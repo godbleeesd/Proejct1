@@ -59,6 +59,7 @@ class ToolBox:
         self.accepted: list[AcceptedHarness] | None = None  # set when generation is over
         self.validation_log: list[dict] = []
         self.written: set[str] = set()  # workspace-relative paths of files the model wrote
+        self.last_valid: list[AcceptedHarness] = []  # harnesses that passed the latest validation
         self._lock = threading.Lock()
 
     @property
@@ -117,8 +118,10 @@ class ToolBox:
                  for h, ok, _, seeds in results if ok]
         all_ok = len(valid) == len(harnesses)
         last_attempt = attempt >= self.max_attempts
-        if all_ok or last_attempt:
-            with self._lock:
+        with self._lock:
+            # Kept in case the session ends (turn or budget limit) before the next attempt.
+            self.last_valid = valid
+            if all_ok or last_attempt:
                 self.accepted = valid
 
         lines = [f"Validation, attempt {attempt} of {self.max_attempts}:"]

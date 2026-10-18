@@ -12,6 +12,7 @@ the parent's trigger job passes down; only the job layout is fixed when the plan
 from __future__ import annotations
 
 ARTIFACTS_EXPIRE = "30 days"
+CACHE_DIR = "bundle-cache"
 # Time for downloading, rebuilding and checking the seeds on top of the fuzzing itself.
 FUZZ_JOB_OVERHEAD = 3600
 
@@ -33,7 +34,10 @@ def child_pipeline(plan: dict, max_harnesses: int, fuzz_seconds: int, runner_tag
         pipeline[f"generate:{slug}"] = {
             "stage": "generate",
             "needs": [plan_needs],
-            "script": [f"sbomfuzz generate plan.json --slug {slug} -o bundles $GENERATE_ARGS"],
+            "script": [f"sbomfuzz generate plan.json --slug {slug} -o bundles --cache {CACHE_DIR} $GENERATE_ARGS"],
+            # Harnesses for this component version survive between pipelines in the runner's cache,
+            # so Claude only writes them once. The slug embeds the version, so the key does too.
+            "cache": {"key": f"sbomfuzz-bundle-{slug}", "paths": [f"{CACHE_DIR}/"], "when": "always"},
             # 5: the subscription's usage limit was reached; the report shows the component as such.
             "allow_failure": {"exit_codes": [5]},
             "artifacts": {"when": "always", "expire_in": ARTIFACTS_EXPIRE,

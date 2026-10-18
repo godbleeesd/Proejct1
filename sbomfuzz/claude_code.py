@@ -46,6 +46,7 @@ class GenerationOutcome:
     attempts: int = 0
     validation: list[dict] = field(default_factory=list)
     written: list[str] = field(default_factory=list)  # files the model wrote, relative to the workspace
+    last_valid: list[dict] = field(default_factory=list)  # harnesses that passed the latest validation
     usage: Usage = field(default_factory=Usage)
     turns: int = 0
 
@@ -82,6 +83,9 @@ class HarnessGenerator:
         ]
         if self.config.model:
             cmd += ["--model", self.config.model]
+        if self.config.max_budget_usd:
+            # Stops a session that runs away (long deliberation, endless fix loops).
+            cmd += ["--max-budget-usd", f"{self.config.max_budget_usd:.2f}"]
         return cmd
 
     def prepare(self) -> None:
@@ -149,18 +153,29 @@ class HarnessGenerator:
             return outcome
 
         problem = text or proc.stderr.strip() or f"claude exited with code {proc.returncode}"
+        subtype = str(result.get("subtype") or "")
         if result.get("is_error") or proc.returncode != 0:
             if _AUTH_ERROR.search(problem) and outcome.turns == 0:
                 raise ClaudeCodeAuthError(problem.splitlines()[0][:300])
             if _USAGE_LIMIT.search(problem):
                 outcome.status, outcome.detail = "usage_limit", problem.splitlines()[0][:300]
-            elif result.get("subtype") == "error_max_turns":
+            elif subtype == "error_max_turns":
                 outcome.detail = f"turn limit ({self.config.max_turns}) reached before the harnesses were accepted"
+            elif "budget" in subtype or "budget" in problem.lower():
+                outcome.detail = (f"session budget (${self.config.max_budget_usd:.2f}) reached before the harnesses "
+                                  "were accepted")
             else:
                 outcome.status, outcome.detail = "error", problem[:500]
         elif text:
             # The model ended without submitting, e.g. because the component is not native code.
             outcome.detail = text.strip().splitlines()[0][:300]
+
+        if outcome.last_valid:
+            # The session stopped mid-way (turn or budget limit, usage limit, ...) after a validation
+            # round in which some harnesses passed: fuzz those rather than nothing.
+            reason = outcome.detail or "the session ended"
+            outcome.status, outcome.harnesses = "done", outcome.last_valid
+            outcome.detail = f"{reason}; kept {len(outcome.last_valid)} harness(es) that had passed validation"
         return outcome
 
     def _load_state(self, outcome: GenerationOutcome) -> None:
@@ -171,6 +186,7 @@ class HarnessGenerator:
         outcome.attempts = state.get("attempts") or 0
         outcome.validation = state.get("validation") or []
         outcome.written = state.get("written") or []
+        outcome.last_valid = state.get("last_valid") or []
         if state.get("accepted") is not None:
             outcome.status, outcome.detail = "done", ""
             outcome.harnesses = state["accepted"]

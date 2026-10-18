@@ -20,7 +20,9 @@ def test_child_pipeline_layout():
 
     gen = p["generate:toml_0.10.2-aaaa"]
     assert gen["needs"] == [{"pipeline": "$PARENT_PIPELINE_ID", "job": "plan"}]
-    assert gen["script"] == ["sbomfuzz generate plan.json --slug toml_0.10.2-aaaa -o bundles $GENERATE_ARGS"]
+    assert gen["script"] == ["sbomfuzz generate plan.json --slug toml_0.10.2-aaaa -o bundles --cache bundle-cache "
+                             "$GENERATE_ARGS"]
+    assert gen["cache"] == {"key": "sbomfuzz-bundle-toml_0.10.2-aaaa", "paths": ["bundle-cache/"], "when": "always"}
     assert gen["allow_failure"] == {"exit_codes": [5]}
     assert gen["artifacts"]["paths"] == ["plan.json", "bundles/toml_0.10.2-aaaa/"]
 

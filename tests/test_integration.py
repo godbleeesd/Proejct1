@@ -261,6 +261,54 @@ def test_pipeline_as_separate_ci_stages(monkeypatch, tmp_path):
     assert f"`../fuzz-results/{toml_slug}/demo`" in report
 
 
+def test_bundle_cache(monkeypatch, tmp_path):
+    """Harnesses for a component version are written once; later runs reuse them without Claude."""
+    pytest.importorskip("atheris")
+    from sbomfuzz import stages
+    from sbomfuzz.prompts import AgentConfig
+    from sbomfuzz.sbom import load_cyclonedx
+
+    fake = [sys.executable, str(Path(__file__).parent / "fake_claude.py")]
+    never = [sys.executable, "-c", "import sys; print('Claude must not be called'); sys.exit(99)"]
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(tmp_path / "fake.log"))
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "oauth-secret")
+    sbom = tmp_path / "bom.json"
+    sbom.write_text(json.dumps({"bomFormat": "CycloneDX", "specVersion": "1.6", "components": [
+        {"type": "library", "name": "toml", "version": "0.10.2", "purl": "pkg:pypi/toml@0.10.2"}]}))
+    c = load_cyclonedx(sbom)[0]
+    cache = tmp_path / "cache"
+    work = Path(tempfile.mkdtemp(prefix="sbomfuzz-work-"))
+    work.chmod(0o755)
+    try:
+        monkeypatch.setattr(claude_code, "CLAUDE_CMD", fake)
+        first = stages.generate(c, AgentConfig(), tmp_path / "b1", work, cache=cache)
+        assert first["status"] == "ready" and not first.get("cached")
+        entry = cache / stages.cache_key(c)
+        assert (entry / "bundle.json").exists() and (entry / "workspace" / "harnesses" / "fuzz_demo.py").exists()
+
+        monkeypatch.setattr(claude_code, "CLAUDE_CMD", never)
+        second = stages.generate(c, AgentConfig(), tmp_path / "b2", work, cache=cache)
+        assert second["status"] == "ready" and second["cached"], second
+        assert second["turns"] == 0 and second["usage"]["output_tokens"] == 0
+        assert [h["name"] for h in second["harnesses"]] == ["demo"]
+        assert (tmp_path / "b2" / c.slug / "workspace" / "corpus" / "demo" / "seed-1").exists()
+        # The reused bundle fuzzes like a fresh one.
+        assert stages.fuzz(tmp_path / "b2" / c.slug, tmp_path / "f2", work, 6, harness_index=1)[0]["result"]["crashes"]
+
+        # A cached harness that no longer works is replaced: Claude is asked again.
+        (entry / "workspace" / "harnesses" / "fuzz_demo.py").write_text("def broken(:\n")
+        monkeypatch.setattr(claude_code, "CLAUDE_CMD", fake)
+        third = stages.generate(c, AgentConfig(), tmp_path / "b3", work, cache=cache)
+        assert third["status"] == "ready" and not third.get("cached")
+        assert "def broken" not in (entry / "workspace" / "harnesses" / "fuzz_demo.py").read_text()
+
+        # --refresh-cache asks Claude even though the cache is good.
+        fourth = stages.generate(c, AgentConfig(), tmp_path / "b4", work, cache=cache, refresh=True)
+        assert fourth["status"] == "ready" and not fourth.get("cached") and fourth["turns"] > 0
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def component(**kw):
     base = dict(group=None, purl=None, purl_type=None, download_url=None, vcs_url=None, bom_ref=None, qualifiers={})
     base.update(kw)

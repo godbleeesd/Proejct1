@@ -15,7 +15,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
 
 # Toolchains: Python + Atheris, clang/libFuzzer + sanitizers, JDK + Maven + Jazzer,
 # and the usual build systems for compiling C/C++ components from source.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Retries: Ubuntu mirrors now and then answer a single download with 502 Bad Gateway.
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
         python3 python3-venv python3-dev \
         clang llvm lld libclang-rt-18-dev \
         build-essential cmake ninja-build meson autoconf automake libtool pkg-config \
