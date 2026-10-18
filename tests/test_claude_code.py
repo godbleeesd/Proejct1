@@ -45,6 +45,8 @@ def test_command_locks_claude_code_down(ws, session_dir):
     assert value("--model") == "claude-sonnet-5-5"
     assert "--strict-mcp-config" in cmd
     assert "demo@1.0" in value("-p")
+    assert value("--max-budget-usd") == "0.50"  # default cap per session
+    assert "--max-budget-usd" not in make_generator(ws, session_dir, max_budget_usd=None).command()
 
 
 def test_subscription_token_wins_over_api_key(ws, session_dir, monkeypatch):
@@ -115,6 +117,17 @@ def test_relative_transcript_path(ws, session_dir, fake_claude, monkeypatch):
     outcome = make_generator(ws, session_dir, transcript=Path("transcript.jsonl")).run()
     assert outcome.status == "done", outcome.detail
     assert '"tool": "write_file"' in (ws.root.parent / "transcript.jsonl").read_text()
+
+
+def test_budget_stop_keeps_the_harnesses_that_passed(ws, session_dir, fake_claude, monkeypatch):
+    # The session budget ran out after a validation round in which one of two harnesses passed:
+    # the passing one is fuzzed instead of the whole component being lost.
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "budget_stop")
+    outcome = make_generator(ws, session_dir, max_budget_usd=0.3).run()
+    assert outcome.status == "done", outcome.detail
+    assert [h["name"] for h in outcome.harnesses] == ["demo"]
+    assert "session budget ($0.30) reached" in outcome.detail
+    assert "kept 1 harness(es) that had passed validation" in outcome.detail
 
 
 def test_no_submission(ws, session_dir, fake_claude, monkeypatch):

@@ -43,6 +43,14 @@ def _agent_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--effort", default="high", choices=["low", "medium", "high", "xhigh", "max"],
                    help="reasoning effort while writing harnesses (default high)")
     p.add_argument("--language", default="English", help="language for harness descriptions (default English)")
+    p.add_argument("--max-budget-usd", type=float, default=0.5, metavar="USD",
+                   help="stop a Claude session once its estimated cost (API-equivalent) reaches this; harnesses "
+                        "that passed validation by then are kept (default 0.50; 0: no cap)")
+    p.add_argument("--cache", type=Path, metavar="DIR",
+                   help="bundle cache: reuse harnesses written earlier for the same component version when "
+                        "they still pass, and store new ones")
+    p.add_argument("--refresh-cache", action="store_true",
+                   help="with --cache: ignore cached harnesses, ask Claude again and replace them")
 
 
 def _fuzz_args(p: argparse.ArgumentParser) -> None:
@@ -173,7 +181,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def _agent_config(args) -> AgentConfig:
     return AgentConfig(model=args.model, effort=args.effort, max_turns=args.max_turns,
-                       max_harnesses=args.max_harnesses, max_attempts=args.fix_attempts, language=args.language)
+                       max_harnesses=args.max_harnesses, max_attempts=args.fix_attempts, language=args.language,
+                       max_budget_usd=args.max_budget_usd or None)
 
 
 def _check_claude() -> bool:
@@ -248,7 +257,8 @@ def _generate(args) -> int:
                 bundle = stages.skipped_bundle(c, args.out, "usage_limit",
                                                "the subscription usage limit was reached before this component")
             else:
-                bundle = stages.generate(c, agent, args.out, args.workdir, args.keep_workdirs)
+                bundle = stages.generate(c, agent, args.out, args.workdir, args.keep_workdirs, args.cache,
+                                         args.refresh_cache)
             statuses.append(bundle["status"])
     except ClaudeCodeAuthError as e:
         return _auth_failed(e)
@@ -295,6 +305,8 @@ def _run(args) -> int:
         limit=args.limit,
         jobs=args.jobs,
         keep_workdirs=args.keep_workdirs,
+        cache=args.cache,
+        refresh_cache=args.refresh_cache,
     )
     try:
         results, _ = run(config)

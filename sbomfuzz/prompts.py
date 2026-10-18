@@ -19,6 +19,7 @@ class AgentConfig:
     max_attempts: int = 3
     command_timeout: int = 1800
     language: str = "English"
+    max_budget_usd: float | None = 0.5  # per session, Claude Code's API-equivalent estimate; None: no cap
 
 
 SYSTEM_PROMPT = """\

@@ -6,6 +6,7 @@ harness-writing session against it, and prints a result object like
   fix (default)  - submit a broken harness, read the validation error, fix it, resubmit
   always_broken  - keep submitting a broken harness until attempts run out
   no_submit      - explore, then stop without submitting
+  budget_stop    - one of two harnesses passes, then the session budget runs out
   usage_limit, auth_error - fail like Claude Code does in those cases
 """
 
@@ -67,6 +68,15 @@ async def session(server: dict, mode: str) -> None:
                 f.write(text)
             if mode == "no_submit":
                 return
+            if mode == "budget_stop":
+                # One harness passes, the other does not; then the session budget runs out.
+                await call(s, "write_file", {"path": HARNESS["source"], "content": GOOD})
+                await call(s, "write_file", {"path": "harnesses/fuzz_demo2.py", "content": BROKEN})
+                second = {**HARNESS, "name": "demo2", "source": "harnesses/fuzz_demo2.py",
+                          "target": "harnesses/fuzz_demo2.py"}
+                text = await call(s, "submit_harnesses", {"harnesses": [HARNESS, second]})
+                assert "demo: OK" in text and "demo2: FAILED" in text, text
+                return
 
             # Shape errors are rejected without using up an attempt.
             text = await call(s, "submit_harnesses", {"harnesses": [{**HARNESS, "seeds": HARNESS["seeds"][:2]}]})
@@ -104,6 +114,9 @@ def main() -> None:
         sys.exit(1)
 
     asyncio.run(session(server, mode))
+    if mode == "budget_stop":
+        print(json.dumps(result(is_error=True, subtype="error_max_budget_usd", result="")))
+        sys.exit(1)
     if mode == "no_submit":
         print(json.dumps(result(result="This component is not native code; no harnesses written.")))
         return

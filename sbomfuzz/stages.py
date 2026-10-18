@@ -13,6 +13,7 @@ workspace and rebuilds the harnesses from the bundle, so it can run on another m
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -86,8 +87,13 @@ def component_from(entry: dict) -> Component:
 
 # --- generate ----------------------------------------------------------------------------
 
-def generate(c: Component, agent: AgentConfig, out_root: Path, workdir: Path, keep_workdir: bool = False) -> dict:
+def generate(c: Component, agent: AgentConfig, out_root: Path, workdir: Path, keep_workdir: bool = False,
+             cache: Path | None = None, refresh: bool = False) -> dict:
     """Download the component and let Claude write validated harnesses; writes <out_root>/<slug>/.
+
+    With a bundle cache, harnesses written earlier for the same component version are reused when
+    they still build and pass their seeds on the fresh download; Claude is not involved then.
+    `refresh` ignores cached harnesses (and replaces them with the new ones).
 
     Bundle statuses: ready (harnesses accepted), no_harness, incomplete, usage_limit, fetch_failed, error.
     Bad credentials raise ClaudeCodeAuthError: no other component can succeed either.
@@ -111,6 +117,13 @@ def generate(c: Component, agent: AgentConfig, out_root: Path, workdir: Path, ke
             log.warning("%s: download failed: %s", c.display_name, str(e).splitlines()[0])
             return bundle
 
+        if cache and not refresh:
+            reused = _reuse_cached(c, ws, cache, out)
+            if reused is not None:
+                bundle.update(reused, fetch_detail=fetched.detail)
+                log.info("%s: ready, %d harness(es) from the bundle cache", c.display_name, len(bundle["harnesses"]))
+                return bundle
+
         log.info("%s: Claude is writing harnesses", c.display_name)
         generated = HarnessGenerator(agent, ECOSYSTEMS[c.ecosystem], c, ws, fetched.detail, out / "transcript.jsonl",
                                      session_dir).run()
@@ -122,7 +135,7 @@ def generate(c: Component, agent: AgentConfig, out_root: Path, workdir: Path, ke
             bundle.update(status="no_harness", detail="no harness passed validation" if generated.attempts
                           else "the model submitted no harnesses")
         else:
-            bundle.update(status="ready", harnesses=generated.harnesses,
+            bundle.update(status="ready", detail=generated.detail, harnesses=generated.harnesses,
                           files=_save_bundle_files(ws, out / BUNDLE_FILES, generated.written))
         log.info("%s: %s%s", c.display_name, bundle["status"],
                  f", {len(bundle['harnesses'])} harness(es)" if bundle["harnesses"] else f": {bundle['detail']}")
@@ -136,9 +149,67 @@ def generate(c: Component, agent: AgentConfig, out_root: Path, workdir: Path, ke
     finally:
         bundle["duration_seconds"] = round(time.monotonic() - start, 1)
         write_json(out / BUNDLE_FILE, bundle)
+        if cache and bundle["status"] == "ready" and not bundle.get("cached"):
+            _store_cached(c, out, cache)
         shutil.rmtree(session_dir, ignore_errors=True)
         if not keep_workdir:
             shutil.rmtree(ws.root, ignore_errors=True)
+
+
+# --- bundle cache ------------------------------------------------------------------------
+
+CACHE_FORMAT = 1  # bump when bundles change shape, so old entries are ignored
+
+
+def cache_key(c: Component) -> str:
+    """One entry per component version (purl, or name@version without one)."""
+    return hashlib.sha256(f"{CACHE_FORMAT}|{c.ecosystem}|{c.key}".encode()).hexdigest()[:24]
+
+
+def _store_cached(c: Component, bundle_dir: Path, cache: Path) -> None:
+    entry = cache.resolve() / cache_key(c)
+    partial = entry.with_name(entry.name + ".part")
+    shutil.rmtree(partial, ignore_errors=True)
+    partial.mkdir(parents=True)
+    shutil.copy2(bundle_dir / BUNDLE_FILE, partial / BUNDLE_FILE)
+    if (bundle_dir / BUNDLE_FILES).is_dir():
+        shutil.copytree(bundle_dir / BUNDLE_FILES, partial / BUNDLE_FILES)
+    shutil.rmtree(entry, ignore_errors=True)
+    partial.rename(entry)
+    log.info("%s: harnesses stored in the bundle cache", c.display_name)
+
+
+def _reuse_cached(c: Component, ws: Workspace, cache: Path, out: Path) -> dict | None:
+    """The cached bundle's fields if its harnesses still work on this download, else None."""
+    entry = cache.resolve() / cache_key(c)
+    if not (entry / BUNDLE_FILE).is_file():
+        return None
+    cached = read_json(entry / BUNDLE_FILE)
+    if cached.get("status") != "ready" or not cached.get("harnesses"):
+        return None
+    ecosystem = ECOSYSTEMS[c.ecosystem]
+    _restore_bundle_files(entry / BUNDLE_FILES, ws)
+    problem = ecosystem.build(ws)
+    if problem is None:
+        for h in cached["harnesses"]:
+            ok, text = ecosystem.validate(ws, h["target"], [ws.root / s for s in h["seeds"]])
+            if not ok:
+                problem = f"{h['name']}: {text.splitlines()[0] if text else 'failed'}"
+                break
+    if problem:
+        log.info("%s: cached harnesses no longer pass (%s), asking Claude for new ones", c.display_name,
+                 problem.splitlines()[0][:120])
+        # Do not leave them for the model to stumble on.
+        for relative in cached.get("files", []):
+            (ws.root / relative).unlink(missing_ok=True)
+        shutil.rmtree(ws.harnesses, ignore_errors=True)
+        ws.harnesses.mkdir()
+        sandbox.give_to_sandbox(ws.harnesses)
+        return None
+    shutil.copytree(entry / BUNDLE_FILES, out / BUNDLE_FILES, dirs_exist_ok=True)
+    return {"status": "ready", "detail": "harnesses reused from the bundle cache", "harnesses": cached["harnesses"],
+            "files": cached.get("files", []), "cached": True, "cached_from": cached.get("created", ""),
+            "model": cached.get("model", "default"), "effort": cached.get("effort", "")}
 
 
 def skipped_bundle(c: Component, out_root: Path, status: str, detail: str) -> dict:

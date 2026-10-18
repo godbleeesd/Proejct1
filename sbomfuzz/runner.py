@@ -34,6 +34,8 @@ class RunConfig:
     limit: int | None = None
     jobs: int = 1
     keep_workdirs: bool = False
+    cache: Path | None = None  # bundle cache directory
+    refresh_cache: bool = False
 
 
 def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
@@ -60,7 +62,8 @@ def run(config: RunConfig) -> tuple[list[ComponentResult], dict]:
             log.info("%s %s: skipped, usage limit reached", tag, c.display_name)
             return
         log.info("%s %s", tag, c.display_name)
-        bundle = stages.generate(c, config.agent, out / BUNDLES_DIR, workdir, config.keep_workdirs)
+        bundle = stages.generate(c, config.agent, out / BUNDLES_DIR, workdir, config.keep_workdirs,
+                                 config.cache, config.refresh_cache)
         if bundle["status"] == "usage_limit":
             stop.set()
         if bundle["status"] == "ready":
